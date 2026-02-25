@@ -1,4 +1,4 @@
-# wgs-batch-effect-analysis
+# Batch Effect Analysis for AoU
 
 Measuring and characterizing sequencing center batch effects in All of Us whole-genome sequencing data. Computes per-sample variant statistics across genomic interval classes and performs pairwise comparisons between sequencing centers, stratified by genetic ancestry, using Hail on Spark.
 
@@ -117,3 +117,7 @@ Designed to run on Google Cloud Dataproc via [Terra](https://terra.bio/).
     ├── scripts/            # Interval download and processing utilities
     └── downsample_report/  # Interval downsampling analysis
 ```
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
