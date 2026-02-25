@@ -1,0 +1,159 @@
+{
+  "created": "2026-02-25T18:33:46.365109+00:00",
+  "command": "python downsample_bed.py sample --input giab_highconf_wgs_calling_regions_hg38_intersection.bed --output giab_highconf_wgs_calling_regions_hg38_intersection.downsampled.bed --interval-dir /Users/ghall/code/work/broad/batch_e/intervals --seed 42 --match-file GRCh38_lowmappabilityall.bed",
+  "input": {
+    "path": "/Users/ghall/code/work/broad/batch_e/intervals/giab_highconf_wgs_calling_regions_hg38_intersection.bed",
+    "intervals": 1047093,
+    "total_bp": 2386029433,
+    "total_bp_fmt": "2.39 Gbp"
+  },
+  "output": {
+    "path": "/Users/ghall/code/work/broad/batch_e/intervals/giab_highconf_wgs_calling_regions_hg38_intersection.downsampled.bed",
+    "intervals": 110084,
+    "total_bp": 248827529,
+    "total_bp_fmt": "248.8 Mbp"
+  },
+  "target": {
+    "bp": 248876769,
+    "bp_fmt": "248.9 Mbp",
+    "source": "--match-file GRCh38_lowmappabilityall.bed (248.9 Mbp)"
+  },
+  "params": {
+    "seed": 42,
+    "stratified": true
+  },
+  "per_chromosome": {
+    "chr1": {
+      "input_intervals": 90536,
+      "input_bp": 200613569,
+      "output_intervals": 9540,
+      "output_bp": 20924119
+    },
+    "chr2": {
+      "input_intervals": 85761,
+      "input_bp": 214266031,
+      "output_intervals": 9095,
+      "output_bp": 22348029
+    },
+    "chr3": {
+      "input_intervals": 70007,
+      "input_bp": 177996046,
+      "output_intervals": 7352,
+      "output_bp": 18564852
+    },
+    "chr4": {
+      "input_intervals": 64056,
+      "input_bp": 171036096,
+      "output_intervals": 6689,
+      "output_bp": 17839392
+    },
+    "chr5": {
+      "input_intervals": 61256,
+      "input_bp": 160515450,
+      "output_intervals": 6533,
+      "output_bp": 16741831
+    },
+    "chr6": {
+      "input_intervals": 60679,
+      "input_bp": 153273388,
+      "output_intervals": 6313,
+      "output_bp": 15979972
+    },
+    "chr7": {
+      "input_intervals": 66134,
+      "input_bp": 135894455,
+      "output_intervals": 7098,
+      "output_bp": 14173436
+    },
+    "chr8": {
+      "input_intervals": 48039,
+      "input_bp": 128574407,
+      "output_intervals": 5131,
+      "output_bp": 13408418
+    },
+    "chr9": {
+      "input_intervals": 45346,
+      "input_bp": 99789608,
+      "output_intervals": 4798,
+      "output_bp": 10399029
+    },
+    "chr10": {
+      "input_intervals": 53189,
+      "input_bp": 116487102,
+      "output_intervals": 5505,
+      "output_bp": 12149745
+    },
+    "chr11": {
+      "input_intervals": 49794,
+      "input_bp": 116703298,
+      "output_intervals": 5146,
+      "output_bp": 12171848
+    },
+    "chr12": {
+      "input_intervals": 51294,
+      "input_bp": 116727695,
+      "output_intervals": 5340,
+      "output_bp": 12171706
+    },
+    "chr13": {
+      "input_intervals": 34547,
+      "input_bp": 87784524,
+      "output_intervals": 3627,
+      "output_bp": 9156255
+    },
+    "chr14": {
+      "input_intervals": 32018,
+      "input_bp": 78326766,
+      "output_intervals": 3348,
+      "output_bp": 8162100
+    },
+    "chr15": {
+      "input_intervals": 34924,
+      "input_bp": 70312760,
+      "output_intervals": 3603,
+      "output_bp": 7328789
+    },
+    "chr16": {
+      "input_intervals": 38206,
+      "input_bp": 66510460,
+      "output_intervals": 4061,
+      "output_bp": 6936427
+    },
+    "chr17": {
+      "input_intervals": 42411,
+      "input_bp": 67278944,
+      "output_intervals": 4528,
+      "output_bp": 7017543
+    },
+    "chr18": {
+      "input_intervals": 24955,
+      "input_bp": 66973405,
+      "output_intervals": 2558,
+      "output_bp": 6984123
+    },
+    "chr19": {
+      "input_intervals": 39486,
+      "input_bp": 45290003,
+      "output_intervals": 4130,
+      "output_bp": 4723953
+    },
+    "chr20": {
+      "input_intervals": 23306,
+      "input_bp": 53811085,
+      "output_intervals": 2421,
+      "output_bp": 5611962
+    },
+    "chr21": {
+      "input_intervals": 13643,
+      "input_bp": 29531457,
+      "output_intervals": 1489,
+      "output_bp": 3080280
+    },
+    "chr22": {
+      "input_intervals": 17506,
+      "input_bp": 28332884,
+      "output_intervals": 1779,
+      "output_bp": 2953720
+    }
+  }
+}
