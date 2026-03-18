@@ -59,14 +59,6 @@ METRIC_DISPLAY_NAMES = {
     "delins_total": "Del/Ins Ratio",
 }
 
-INTERVAL_DESCRIPTIONS = {
-    "ACMG59": "59 clinically actionable genes (ACMG SF v3.2)",
-    "Low_Mappability": "Regions with low unique mappability (multi-mapping reads)",
-    "GC_gt_85": "Extreme high GC content regions (>85%)",
-    "GC_lt_25": "Extreme low GC content regions (<25%)",
-    "HighConf_Genome": "GIAB high-confidence callable regions (~90% of genome)",
-}
-
 SEVERITY_COLORS = {
     "not appreciable": "#d4edda",  # green
     "appreciable": "#f8d7da",      # red/pink
@@ -139,6 +131,7 @@ class ReportData:
     timing: Optional[Dict[str, Any]] = None
     input_path: str = ""
     effect_threshold: float = 0.5
+    comparison_name: str = "group"  # human label for comparison variable
 
 
 def _open_file(path: str, mode: str = "r"):
@@ -169,6 +162,18 @@ def _join_path(base: str, name: str) -> str:
     return os.path.join(base, name)
 
 
+def _validate_comparisons(df: pd.DataFrame) -> pd.DataFrame:
+    """Validate that comparisons TSV has required v2 columns."""
+    required = {"group_x", "group_y", "comparison"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(
+            f"Comparisons TSV missing required columns: {missing}. "
+            f"Expected: group_x, group_y, comparison"
+        )
+    return df
+
+
 def load_report_data(
     input_path: str,
     load_sample_stats: bool = True,
@@ -195,6 +200,9 @@ def load_report_data(
         data.comparisons = pd.read_csv(f, sep="\t")
     logger.info(f"  {len(data.comparisons)} comparison rows loaded")
 
+    # Validate schema
+    data.comparisons = _validate_comparisons(data.comparisons)
+
     logger.info("Loading group_summaries.tsv ...")
     with _open_file(summ_path) as f:
         data.group_summaries = pd.read_csv(f, sep="\t")
@@ -212,6 +220,15 @@ def load_report_data(
         logger.info("Loading timing_metrics.json ...")
         with _open_file(timing_path) as f:
             data.timing = json.load(f)
+
+    # Determine comparison_name from config or from data
+    if data.config and data.config.get("comparison_name"):
+        data.comparison_name = data.config["comparison_name"]
+    elif "comparison" in data.comparisons.columns:
+        # Use the first value from the comparison column
+        data.comparison_name = data.comparisons["comparison"].iloc[0]
+    else:
+        data.comparison_name = "group"
 
     if load_sample_stats:
         stats_path = _join_path(input_path, "sample_stats.tsv")
@@ -234,14 +251,10 @@ def parse_metric_name(metric: str) -> Tuple[str, str]:
     Handles underscore-heavy names like 'GC_gt_85_indel_total' by matching
     known suffixes from longest to shortest.
 
-    Args:
-        metric: Full metric column name, e.g. 'Low_Mappability_snp_total'
-
     Returns:
         Tuple of (interval_name, metric_type), e.g. ('Low_Mappability', 'snp_total').
         Falls back to ('unknown', metric) if no known suffix matches.
     """
-    # Sort suffixes longest-first so we match the most specific suffix
     for suffix in sorted(KNOWN_METRIC_SUFFIXES, key=len, reverse=True):
         if metric.endswith(suffix):
             interval = metric[: -len(suffix)]
@@ -303,12 +316,12 @@ def safe_render(fn, *args, **kwargs) -> str:
         )
 
 
-def _get_batch_colors(batches: List[str]) -> Dict[str, str]:
-    """Assign consistent bold colors to batches."""
+def _get_group_colors(groups: List[str]) -> Dict[str, str]:
+    """Assign consistent bold colors to groups."""
     BOLD_COLORS = ["#e41a1c", "#377eb8", "#4daf4a", "#984ea3", "#ff7f00",
                    "#a65628", "#f781bf", "#999999"]
-    sorted_batches = sorted(batches)
-    return {b: BOLD_COLORS[i % len(BOLD_COLORS)] for i, b in enumerate(sorted_batches)}
+    sorted_groups = sorted(groups)
+    return {g: BOLD_COLORS[i % len(BOLD_COLORS)] for i, g in enumerate(sorted_groups)}
 
 
 # ---------------------------------------------------------------------------
@@ -331,7 +344,7 @@ def chart_significance_table(data: ReportData) -> str:
     flagged["interval"] = [p[0] for p in parsed]
     flagged["metric_type"] = [p[1] for p in parsed]
     flagged["severity"] = flagged["cohens_d"].apply(severity_label)
-    flagged["batch_pair"] = flagged["batch_x"] + " vs " + flagged["batch_y"]
+    flagged["group_pair"] = flagged["group_x"] + " vs " + flagged["group_y"]
 
     total = len(df)
     n_flagged = len(flagged)
@@ -340,7 +353,7 @@ def chart_significance_table(data: ReportData) -> str:
     # Text summary
     html = '<div class="card">'
     html += f"<p><strong>{n_appreciable}</strong> of {total} comparisons show "
-    html += f"appreciable batch effects (|d| &ge; {APPRECIABLE_THRESHOLD})."
+    html += f"appreciable effects (|d| &ge; {APPRECIABLE_THRESHOLD})."
 
     if n_flagged > 0:
         top_intervals = flagged["interval"].value_counts().head(3).index.tolist()
@@ -354,10 +367,10 @@ def chart_significance_table(data: ReportData) -> str:
 
     # Build table
     use_details = n_flagged > 20
-    table_html = _build_flagged_table(flagged)
+    table_html = _build_flagged_table(flagged, data.comparison_name)
 
     if use_details:
-        top_20 = _build_flagged_table(flagged.head(20))
+        top_20 = _build_flagged_table(flagged.head(20), data.comparison_name)
         html += top_20
         html += f"<details><summary>Show all {n_flagged} flagged comparisons</summary>"
         html += table_html
@@ -368,14 +381,15 @@ def chart_significance_table(data: ReportData) -> str:
     return html
 
 
-def _build_flagged_table(df: pd.DataFrame) -> str:
+def _build_flagged_table(df: pd.DataFrame, comparison_name: str) -> str:
     """Build an HTML table from flagged comparisons."""
     ancestry_col = "ancestry" if "ancestry" in df.columns else None
+    pair_label = f"{comparison_name.replace('_', ' ').title()} Pair"
 
     html = "<table><thead><tr>"
     if ancestry_col:
         html += "<th>Ancestry</th>"
-    html += "<th>Batch Pair</th><th>Interval</th><th>Metric</th>"
+    html += f"<th>{pair_label}</th><th>Interval</th><th>Metric</th>"
     html += "<th>Cohen's d</th><th>p-value</th><th>Severity</th>"
     html += "</tr></thead><tbody>"
 
@@ -385,7 +399,7 @@ def _build_flagged_table(df: pd.DataFrame) -> str:
         if ancestry_col:
             anc = row.get("ancestry", "")
             html += f"<td>{anc}</td>"
-        html += f"<td>{row['batch_pair']}</td>"
+        html += f"<td>{row['group_pair']}</td>"
         html += f"<td>{row['interval']}</td>"
         html += f"<td>{display_metric(row['metric_type'])}</td>"
         html += f"<td>{row['cohens_d']:.3f}</td>"
@@ -403,7 +417,7 @@ def chart_effect_heatmap(data: ReportData) -> str:
     parsed = df["metric"].apply(parse_metric_name)
     df["interval"] = [p[0] for p in parsed]
     df["metric_type"] = [p[1] for p in parsed]
-    df["batch_pair"] = df["batch_x"] + " vs " + df["batch_y"]
+    df["group_pair"] = df["group_x"] + " vs " + df["group_y"]
     df["row_label"] = df["interval"] + " / " + df["metric_type"].map(display_metric)
 
     # Filter to key metrics for readability
@@ -418,7 +432,7 @@ def chart_effect_heatmap(data: ReportData) -> str:
             continue
 
         pivot = sub.pivot_table(
-            index="row_label", columns="batch_pair",
+            index="row_label", columns="group_pair",
             values="cohens_d", aggfunc="first",
         )
         if pivot.empty:
@@ -426,7 +440,7 @@ def chart_effect_heatmap(data: ReportData) -> str:
 
         # Annotation: d value + asterisk if significant
         pval_pivot = sub.pivot_table(
-            index="row_label", columns="batch_pair",
+            index="row_label", columns="group_pair",
             values="p_value", aggfunc="first",
         )
 
@@ -482,7 +496,6 @@ def chart_volcano(data: ReportData) -> str:
     fig, axes = plt.subplots(1, n_anc, figsize=(7 * n_anc, 6), squeeze=False)
 
     intervals = sorted(df["interval"].unique())
-    # Bold, saturated palette instead of pastel Set2
     BOLD_COLORS = ["#e41a1c", "#377eb8", "#4daf4a", "#984ea3", "#ff7f00",
                    "#a65628", "#f781bf", "#999999"]
     interval_palette = dict(zip(intervals, BOLD_COLORS[:len(intervals)]))
@@ -538,7 +551,7 @@ def chart_volcano(data: ReportData) -> str:
 
     fig.tight_layout()
     caption = (
-        f"Each point is one (interval, metric, batch-pair) comparison. "
+        f"Each point is one (interval, metric, group-pair) comparison. "
         f"Vertical lines at d = +/-{data.effect_threshold}. "
         f"Points labeled when |d| > 0.3 and above Bonferroni threshold."
     )
@@ -546,11 +559,7 @@ def chart_volcano(data: ReportData) -> str:
 
 
 def chart_cross_ancestry(data: ReportData) -> str:
-    """Scatter of Cohen's d in one ancestry vs another to show consistency.
-
-    Points on the diagonal indicate the same batch effect replicates across
-    ancestries — evidence of technical rather than biological origin.
-    """
+    """Scatter of Cohen's d in one ancestry vs another to show consistency."""
     df = data.comparisons.copy()
     if "ancestry" not in df.columns or df["ancestry"].nunique() < 2:
         return '<div class="alert alert-info">Cross-ancestry plot requires multiple ancestries.</div>'
@@ -558,8 +567,8 @@ def chart_cross_ancestry(data: ReportData) -> str:
     parsed = df["metric"].apply(parse_metric_name)
     df["interval"] = [p[0] for p in parsed]
     df["metric_type"] = [p[1] for p in parsed]
-    df["batch_pair"] = df["batch_x"] + " vs " + df["batch_y"]
-    df["comparison_key"] = df["batch_pair"] + " | " + df["metric"]
+    df["group_pair"] = df["group_x"] + " vs " + df["group_y"]
+    df["comparison_key"] = df["group_pair"] + " | " + df["metric"]
 
     # Focus on key metrics
     df = df[df["metric_type"].isin(KEY_METRIC_TYPES)]
@@ -585,29 +594,29 @@ def chart_cross_ancestry(data: ReportData) -> str:
 
     # Add interval info for coloring
     key_to_interval = df.drop_duplicates("comparison_key").set_index("comparison_key")["interval"]
-    key_to_pair = df.drop_duplicates("comparison_key").set_index("comparison_key")["batch_pair"]
+    key_to_pair = df.drop_duplicates("comparison_key").set_index("comparison_key")["group_pair"]
     merged["interval"] = key_to_interval.loc[common].values
-    merged["batch_pair"] = key_to_pair.loc[common].values
+    merged["group_pair"] = key_to_pair.loc[common].values
 
     intervals = sorted(merged["interval"].unique())
     BOLD_COLORS = ["#e41a1c", "#377eb8", "#4daf4a", "#984ea3", "#ff7f00",
                    "#a65628", "#f781bf", "#999999"]
     interval_palette = dict(zip(intervals, BOLD_COLORS[:len(intervals)]))
 
-    batch_pairs = sorted(merged["batch_pair"].unique())
+    group_pairs = sorted(merged["group_pair"].unique())
     MARKERS = ["o", "s", "D", "^", "v", "P", "X", "*"]
-    pair_markers = dict(zip(batch_pairs, MARKERS[:len(batch_pairs)]))
+    pair_markers = dict(zip(group_pairs, MARKERS[:len(group_pairs)]))
 
     fig, ax = plt.subplots(figsize=(8, 7))
 
-    for bp in batch_pairs:
+    for gp in group_pairs:
         for iv in intervals:
-            sub = merged[(merged["batch_pair"] == bp) & (merged["interval"] == iv)]
+            sub = merged[(merged["group_pair"] == gp) & (merged["interval"] == iv)]
             if sub.empty:
                 continue
             ax.scatter(
                 sub[f"d_{anc_x_name}"], sub[f"d_{anc_y_name}"],
-                c=interval_palette[iv], marker=pair_markers[bp],
+                c=interval_palette[iv], marker=pair_markers[gp],
                 s=80, alpha=0.85, edgecolors="black", linewidth=0.4,
                 zorder=3,
             )
@@ -631,22 +640,22 @@ def chart_cross_ancestry(data: ReportData) -> str:
         d_max = max(abs(row[f"d_{anc_x_name}"]), abs(row[f"d_{anc_y_name}"]))
         if d_max > 0.3 or d_diff > 0.3:
             ax.annotate(
-                f"{row['interval']}\n{row['batch_pair']}",
+                f"{row['interval']}\n{row['group_pair']}",
                 (row[f"d_{anc_x_name}"], row[f"d_{anc_y_name}"]),
                 fontsize=6.5, ha="center", va="bottom",
                 xytext=(0, 6), textcoords="offset points",
                 bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="grey", alpha=0.8, lw=0.5),
             )
 
-    # Build legend: colors for intervals, markers for batch pairs
+    # Build legend: colors for intervals, markers for group pairs
     interval_handles = [plt.Line2D([0], [0], marker="o", color="w",
                         markerfacecolor=interval_palette[iv], markersize=9,
                         markeredgecolor="black", markeredgewidth=0.4, label=iv)
                         for iv in intervals]
-    pair_handles = [plt.Line2D([0], [0], marker=pair_markers[bp], color="w",
+    pair_handles = [plt.Line2D([0], [0], marker=pair_markers[gp], color="w",
                     markerfacecolor="grey", markersize=8,
-                    markeredgecolor="black", markeredgewidth=0.4, label=bp)
-                    for bp in batch_pairs]
+                    markeredgecolor="black", markeredgewidth=0.4, label=gp)
+                    for gp in group_pairs]
     ax.legend(handles=interval_handles + pair_handles, fontsize=8,
               loc="upper left", framealpha=0.9, ncol=1)
 
@@ -656,9 +665,9 @@ def chart_cross_ancestry(data: ReportData) -> str:
     # Correlation
     r = merged[f"d_{anc_x_name}"].corr(merged[f"d_{anc_y_name}"])
     caption = (
-        f"Each point is one (interval, metric, batch-pair) comparison. "
+        f"Each point is one (interval, metric, group-pair) comparison. "
         f"Points on the diagonal indicate identical effects in both ancestries (r = {r:.2f}). "
-        f"Color = interval, shape = batch pair. Green bands mark |d| < 0.2."
+        f"Color = interval, shape = group pair. Green bands mark |d| < 0.2."
     )
     return embed_figure(fig, caption)
 
@@ -666,6 +675,7 @@ def chart_cross_ancestry(data: ReportData) -> str:
 def chart_grouped_bars(data: ReportData) -> str:
     """Grouped bar charts of mean metrics from group_summaries."""
     gs = data.group_summaries.copy()
+    comp_name = data.comparison_name
     if gs.empty:
         return '<div class="alert alert-info">No group summary data available.</div>'
 
@@ -680,8 +690,8 @@ def chart_grouped_bars(data: ReportData) -> str:
 
     intervals = sorted(set(iv for _, iv, _ in key_cols))
     has_ancestry = "ancestry" in gs.columns
-    batches = sorted(gs["batch"].unique())
-    batch_colors = _get_batch_colors(batches)
+    groups = sorted(gs[comp_name].unique())
+    group_colors = _get_group_colors(groups)
 
     html = ""
     for metric_type in KEY_METRIC_TYPES:
@@ -708,26 +718,26 @@ def chart_grouped_bars(data: ReportData) -> str:
             for ii, (mean_col, interval) in enumerate(relevant):
                 ax = axes[ai, ii]
                 std_col = mean_col.replace("_mean", "_std")
-                x = np.arange(len(batches))
+                x = np.arange(len(groups))
                 width = 0.7
 
                 means = []
                 stds = []
                 colors = []
-                for batch in batches:
-                    row = sub[sub["batch"] == batch]
+                for group in groups:
+                    row = sub[sub[comp_name] == group]
                     if len(row) == 0:
                         means.append(0)
                         stds.append(0)
                     else:
                         means.append(row[mean_col].values[0])
                         stds.append(row[std_col].values[0] if std_col in row.columns else 0)
-                    colors.append(batch_colors[batch])
+                    colors.append(group_colors[group])
 
                 ax.bar(x, means, width, yerr=stds, color=colors,
                        capsize=3, edgecolor="white", linewidth=0.5, alpha=0.85)
                 ax.set_xticks(x)
-                ax.set_xticklabels(batches, fontsize=7, rotation=30, ha="right")
+                ax.set_xticklabels(groups, fontsize=7, rotation=30, ha="right")
 
                 if ai == 0:
                     ax.set_title(interval, fontsize=9, fontweight="bold")
@@ -737,9 +747,10 @@ def chart_grouped_bars(data: ReportData) -> str:
                         label = f"{anc.upper()}\n{display_metric(metric_type)}"
                     ax.set_ylabel(label, fontsize=9)
 
-        fig.suptitle(f"Mean {display_metric(metric_type)} by Batch", fontsize=12, fontweight="bold")
+        comp_display = comp_name.replace("_", " ").title()
+        fig.suptitle(f"Mean {display_metric(metric_type)} by {comp_display}", fontsize=12, fontweight="bold")
         fig.tight_layout()
-        html += embed_figure(fig, f"Mean {display_metric(metric_type)} (+/- 1 SD) by batch and interval.")
+        html += embed_figure(fig, f"Mean {display_metric(metric_type)} (+/- 1 SD) by {comp_display} and interval.")
 
     return html
 
@@ -750,21 +761,22 @@ def chart_distributions(data: ReportData) -> str:
         return '<div class="alert alert-info">sample_stats.tsv not loaded — distribution plots skipped.</div>'
 
     ss = data.sample_stats.copy()
+    comp_name = data.comparison_name
     has_ancestry = "ancestry" in ss.columns
 
     # Subsample for rendering speed
     max_per_group = 5000
     if has_ancestry:
-        ss = ss.groupby(["batch", "ancestry"], group_keys=False).apply(
+        ss = ss.groupby([comp_name, "ancestry"], group_keys=False).apply(
             lambda g: g.sample(n=min(len(g), max_per_group), random_state=42)
         )
     else:
-        ss = ss.groupby("batch", group_keys=False).apply(
+        ss = ss.groupby(comp_name, group_keys=False).apply(
             lambda g: g.sample(n=min(len(g), max_per_group), random_state=42)
         )
 
     # Find metric columns for key metrics
-    id_cols = {"s", "batch", "ancestry", "ancestry_pred_other"}
+    id_cols = {"s", comp_name, "ancestry", "ancestry_pred_other"}
     metric_cols = [c for c in ss.columns if c not in id_cols]
     parsed = [(c, *parse_metric_name(c)) for c in metric_cols]
     key = [(c, iv, mt) for c, iv, mt in parsed if mt in KEY_METRIC_TYPES]
@@ -773,9 +785,9 @@ def chart_distributions(data: ReportData) -> str:
         return '<div class="alert alert-info">No key metrics found in sample stats.</div>'
 
     intervals = sorted(set(iv for _, iv, _ in key))
-    batches = sorted(ss["batch"].unique())
-    batch_colors = _get_batch_colors(batches)
-    palette = {b: batch_colors[b] for b in batches}
+    groups = sorted(ss[comp_name].unique())
+    group_colors = _get_group_colors(groups)
+    palette = {g: group_colors[g] for g in groups}
 
     html = ""
     for metric_type in KEY_METRIC_TYPES:
@@ -801,13 +813,13 @@ def chart_distributions(data: ReportData) -> str:
             sub = ss[ss["ancestry"] == anc] if anc else ss
             for ii, (col, interval) in enumerate(cols_for_mt):
                 ax = axes[ai, ii]
-                plot_df = sub[["batch", col]].dropna()
+                plot_df = sub[[comp_name, col]].dropna()
                 if plot_df.empty:
                     ax.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax.transAxes)
                     continue
 
                 sns.violinplot(
-                    data=plot_df, x="batch", y=col, hue="batch",
+                    data=plot_df, x=comp_name, y=col, hue=comp_name,
                     palette=palette, ax=ax, inner="quartile",
                     linewidth=0.8, cut=0, density_norm="width", legend=False,
                 )
@@ -824,7 +836,8 @@ def chart_distributions(data: ReportData) -> str:
                 else:
                     ax.set_ylabel("")
 
-        fig.suptitle(f"Distribution of {display_metric(metric_type)} by Batch", fontsize=12, fontweight="bold")
+        comp_display = comp_name.replace("_", " ").title()
+        fig.suptitle(f"Distribution of {display_metric(metric_type)} by {comp_display}", fontsize=12, fontweight="bold")
         fig.tight_layout()
         html += embed_figure(fig, f"Violin plots of per-sample {display_metric(metric_type)}. Inner lines show quartiles.")
 
@@ -832,7 +845,7 @@ def chart_distributions(data: ReportData) -> str:
 
 
 def chart_pca(data: ReportData) -> str:
-    """PCA scatter of sample metrics, colored by batch."""
+    """PCA scatter of sample metrics, colored by comparison group."""
     if data.sample_stats is None:
         return '<div class="alert alert-info">sample_stats.tsv not loaded — PCA plots skipped.</div>'
 
@@ -840,16 +853,17 @@ def chart_pca(data: ReportData) -> str:
     from sklearn.preprocessing import StandardScaler
 
     ss = data.sample_stats.copy()
+    comp_name = data.comparison_name
     has_ancestry = "ancestry" in ss.columns
 
-    id_cols = {"s", "batch", "ancestry", "ancestry_pred_other"}
+    id_cols = {"s", comp_name, "ancestry", "ancestry_pred_other"}
     metric_cols = [c for c in ss.columns if c not in id_cols]
 
     if len(metric_cols) < 3:
         return '<div class="alert alert-info">Too few metrics for PCA.</div>'
 
-    batches = sorted(ss["batch"].unique())
-    batch_colors = _get_batch_colors(batches)
+    groups = sorted(ss[comp_name].unique())
+    group_colors = _get_group_colors(groups)
 
     if has_ancestry:
         ancestries = sorted(ss["ancestry"].dropna().unique())
@@ -877,13 +891,13 @@ def chart_pca(data: ReportData) -> str:
         pca = PCA(n_components=2)
         pcs = pca.fit_transform(X_scaled)
 
-        for batch in batches:
-            mask = sub["batch"].values == batch
+        for group in groups:
+            mask = sub[comp_name].values == group
             if mask.sum() == 0:
                 continue
             ax.scatter(
                 pcs[mask, 0], pcs[mask, 1],
-                c=[batch_colors[batch]], label=batch,
+                c=[group_colors[group]], label=group,
                 s=18, alpha=0.45, edgecolors="black", linewidths=0.3,
             )
 
@@ -964,17 +978,18 @@ def _render_header(data: ReportData, title: str) -> str:
     html = f"<h1>{title}</h1>"
     html += f'<p style="color:#666">Generated {now} from <code>{data.input_path}</code></p>'
 
+    comp_display = data.comparison_name.replace("_", " ").title()
+
     # Config summary card
     if data.config:
         cfg = data.config
         html += '<div class="card"><h3>Run Configuration</h3>'
         html += '<div class="grid-2">'
         fields = [
-            ("Mode", cfg.get("mode")),
+            ("Comparison", f"{cfg.get('comparison_name', '')} (col: {cfg.get('comparison_col', '')})"),
             ("Samples/Group", cfg.get("samples_per_group")),
-            ("Strategy", cfg.get("analysis_strategy")),
-            ("Batches", ", ".join(cfg.get("batches", []) or [])),
-            ("Ancestries", ", ".join(cfg.get("ancestries", []) or [])),
+            ("Ancestries", ", ".join(cfg.get("ancestries", []) or ["all"])),
+            ("Comparison Values", ", ".join(cfg.get("comparison_values", []) or ["all"])),
             ("Intervals", ", ".join((cfg.get("interval_dict") or {}).keys())),
             ("Run Name", cfg.get("run_name")),
             ("Filter to PASS", cfg.get("filter_to_pass")),
@@ -988,21 +1003,21 @@ def _render_header(data: ReportData, title: str) -> str:
     # Sample size table from comparisons
     df = data.comparisons
     if not df.empty:
-        html += '<div class="card"><h3>Sample Sizes</h3>'
-        # Extract unique (batch, ancestry) counts from n_x / n_y
+        html += f'<div class="card"><h3>Sample Sizes</h3>'
+        # Extract unique (group, ancestry) counts from n_x / n_y
         rows = []
         has_anc = "ancestry" in df.columns
         for _, r in df.iterrows():
             anc = r.get("ancestry", "") if has_anc else ""
-            rows.append({"batch": r["batch_x"], "ancestry": anc, "n": r["n_x"]})
-            rows.append({"batch": r["batch_y"], "ancestry": anc, "n": r["n_y"]})
+            rows.append({comp_display: r["group_x"], "ancestry": anc, "n": r["n_x"]})
+            rows.append({comp_display: r["group_y"], "ancestry": anc, "n": r["n_y"]})
 
         sizes = pd.DataFrame(rows).drop_duplicates()
         if has_anc:
-            pivot = sizes.pivot_table(index="batch", columns="ancestry", values="n", aggfunc="first")
+            pivot = sizes.pivot_table(index=comp_display, columns="ancestry", values="n", aggfunc="first")
             pivot = pivot.reindex(sorted(pivot.columns), axis=1)
         else:
-            pivot = sizes.groupby("batch")["n"].first().to_frame()
+            pivot = sizes.groupby(comp_display)["n"].first().to_frame()
 
         html += pivot.to_html(classes="", na_rep="-", float_format=lambda x: f"{x:.0f}")
         html += "</div>"
@@ -1010,7 +1025,7 @@ def _render_header(data: ReportData, title: str) -> str:
     return html
 
 
-def _render_methods() -> str:
+def _render_methods(data: ReportData) -> str:
     """Render methods and interpretation guide."""
     html = '<div class="methods">'
     html += "<h2>Methods &amp; Interpretation Guide</h2>"
@@ -1036,11 +1051,13 @@ def _render_methods() -> str:
     html += "medium-sized effect and was chosen before looking at any data. "
     html += "Randomized control experiments show a noise floor of |d| &lt; 0.35.</p>"
 
-    html += "<h3>Genomic Intervals</h3>"
-    html += "<table><tr><th>Interval</th><th>Description</th></tr>"
-    for name, desc in INTERVAL_DESCRIPTIONS.items():
-        html += f"<tr><td><strong>{name}</strong></td><td>{desc}</td></tr>"
-    html += "</table>"
+    # Interval descriptions from config if available
+    if data.config and data.config.get("interval_dict"):
+        html += "<h3>Genomic Intervals</h3>"
+        html += "<table><tr><th>Interval</th><th>Path</th></tr>"
+        for name, path in data.config["interval_dict"].items():
+            html += f"<tr><td><strong>{name}</strong></td><td><code>{path}</code></td></tr>"
+        html += "</table>"
 
     html += "<h3>Caveats</h3>"
     html += "<ul>"
@@ -1053,15 +1070,7 @@ def _render_methods() -> str:
 
 
 def render_report(data: ReportData, title: str = "Batch Effect Report") -> str:
-    """Assemble the full HTML report.
-
-    Args:
-        data: Loaded ReportData.
-        title: Report title.
-
-    Returns:
-        Complete HTML document as a string.
-    """
+    """Assemble the full HTML report."""
     sections = []
 
     # Header
@@ -1084,7 +1093,8 @@ def render_report(data: ReportData, title: str = "Batch Effect Report") -> str:
     sections.append(safe_render(chart_cross_ancestry, data))
 
     # Grouped bars
-    sections.append("<h2>Group Means by Batch</h2>")
+    comp_display = data.comparison_name.replace("_", " ").title()
+    sections.append(f"<h2>Group Means by {comp_display}</h2>")
     sections.append(safe_render(chart_grouped_bars, data))
 
     # Distributions (conditional)
@@ -1100,7 +1110,7 @@ def render_report(data: ReportData, title: str = "Batch Effect Report") -> str:
     sections.append(safe_render(chart_timing, data))
 
     # Methods
-    sections.append(safe_render(_render_methods))
+    sections.append(safe_render(_render_methods, data))
 
     body = "\n".join(sections)
 
@@ -1135,16 +1145,6 @@ def generate_report(
 
     In a Jupyter notebook this returns an IPython HTML display object that
     renders inline. From the CLI or plain Python it returns the HTML string.
-
-    Args:
-        input_path: Directory (local or gs://) containing pipeline result files.
-        output_path: Optional path to also save the HTML file.
-        title: Report title.
-        load_sample_stats: Whether to load sample_stats.tsv (slow for large runs).
-        effect_threshold: Cohen's d threshold for flagging effects.
-
-    Returns:
-        IPython HTML display object when in a notebook, else the raw HTML string.
     """
     import warnings
     warnings.filterwarnings("ignore", category=RuntimeWarning, message="All-NaN")
@@ -1182,11 +1182,7 @@ def generate_report(
 
 
 def _wrap_with_download_link(html: str, title: str) -> str:
-    """Wrap report HTML with a base64 data-URI download link at the top.
-
-    This creates a clickable "Download Report" link that works in any
-    Jupyter environment without requiring file paths or server config.
-    """
+    """Wrap report HTML with a base64 data-URI download link at the top."""
     b64 = base64.b64encode(html.encode("utf-8")).decode("utf-8")
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     filename = f"batch_effect_report_{timestamp}.html"

@@ -1,47 +1,28 @@
-# Batch Effect Analysis for AoU
+# Batch Effect Analysis Pipeline
 
-Measuring and characterizing sequencing center batch effects in All of Us whole-genome sequencing data. Computes per-sample variant statistics across genomic interval classes and performs pairwise comparisons between sequencing centers, stratified by genetic ancestry, using Hail on Spark.
+A general-purpose pipeline for measuring group-level batch effects in whole-genome sequencing (WGS) variant callsets. Compares a user-supplied grouping variable (e.g., sequencing center, instrument, lab) across genomic interval classes, stratified by genetic ancestry, using Hail on Spark.
 
 ## Overview
 
-Large-scale WGS consortia aggregate data from multiple sequencing centers, each with potentially different instruments, library prep protocols, and bioinformatics pipelines. These technical differences can introduce systematic batch effects that confound downstream analyses, particularly for rare variant studies.
+Large-scale WGS consortia aggregate data from multiple sources, each with potentially different instruments, library prep protocols, and bioinformatics pipelines. These technical differences can introduce systematic batch effects that confound downstream analyses, particularly for rare variant studies.
 
 This pipeline implements a **within-ancestry stratified analysis** to separate technical batch effects from population structure:
 
 1. Stratify samples by genetic ancestry to avoid confounding
 2. Compute per-sample variant statistics (SNPs, indels, Ti/Tv ratios) across genomic regions
-3. Perform pairwise statistical comparisons between sequencing centers (Cohen's d, Welch's t-test)
+3. Perform pairwise statistical comparisons between groups (Cohen's d, Welch's t-test)
 4. Focus on genomic regions known to be technically challenging (low mappability, GC extremes, etc.)
 
 ## Pipeline Steps
 
 | Step | Description |
 |------|-------------|
-| 1 | Load sample metadata (ancestry, batch labels) and subsample |
+| 1 | Load ancestry + comparison metadata TSVs, merge, subsample |
 | 2 | Load variant data (VCF or pre-built MatrixTable), filter to target intervals |
-| 3 | Annotate samples with batch and ancestry labels |
+| 3 | Annotate samples with ancestry and comparison group labels |
 | 4 | Compute per-sample variant counts by interval (explode + group_by aggregation) |
 | 5 | Extract results to pandas; compute derived metrics and pairwise comparisons |
 | 6 | Save results and timing metrics |
-
-## Run Modes
-
-| Mode | Samples/Group | Chromosomes | Use Case |
-|------|---------------|-------------|----------|
-| `smoke` | 100 | chr17 | Quick validation (~10 min) |
-| `dev` | 1,000 | chr7, chr13, chr17 | Development (~2-3 hrs) |
-| `medium` | 5,000 | All | Statistical validation |
-| `full` | 10,000 | All | Production analysis |
-
-## Genomic Intervals
-
-| Interval | Description | Count |
-|----------|-------------|------:|
-| ACMG59 | Clinically actionable genes | 1,221 |
-| Low_Mappability | Regions prone to alignment artifacts | 673,815 |
-| GC_gt_85 | High GC content (>85%) | 1,998 |
-| GC_lt_25 | Low GC content (<25%) | 487,211 |
-| HighConf_Genome | GIAB high-confidence calling regions | 1,047,093 |
 
 ## Usage
 
@@ -51,9 +32,19 @@ This pipeline implements a **within-ancestry stratified analysis** to separate t
 from batch_e import PipelineConfig, run_pipeline
 
 cfg = PipelineConfig(
-    mode='dev',
+    data_source='mt',
+    hail_mt_path='gs://bucket/data.mt/',
+    ancestry_tsv='gs://bucket/ancestry.tsv',
+    ancestry_col='ancestry_pred_other',
+    comparison_tsv='gs://bucket/site_labels.tsv',
+    comparison_col='site_id',
+    comparison_name='sequencing_center',
     ancestries=['eur', 'afr'],
-    batches=['bi_S4', 'bcm_S4', 'uw_S4'],
+    interval_dict={
+        'ACMG59': 'gs://bucket/interval_lists/acmg59.bed',
+        'Low_Mappability': 'gs://bucket/interval_lists/lowmap.bed.gz',
+    },
+    samples_per_group=5000,
 )
 
 results = run_pipeline(cfg)
@@ -68,18 +59,77 @@ significant = comparisons[comparisons['cohens_d'].abs() > 0.5]
 ### From the command line
 
 ```bash
-python batch_e.py --mode dev \
-    --batches bi_S4 bcm_S4 uw_S4 \
-    --ancestries eur afr \
-    --data-source vcf \
-    --output-dir gs://my-bucket/results/
+python batch_e.py \
+    --data-source mt --mt-path gs://bucket/data.mt/ \
+    --ancestry-tsv gs://bucket/ancestry.tsv \
+    --ancestry-col ancestry_pred_other \
+    --comparison-tsv gs://bucket/site_labels.tsv \
+    --comparison-col site_id \
+    --comparison-name sequencing_center \
+    --interval ACMG59=gs://bucket/acmg59.bed \
+    --interval Low_Mappability=gs://bucket/lowmap.bed.gz \
+    --samples-per-group 5000 \
+    --output-dir gs://bucket/results/
 ```
 
 ### Generate a report
 
 ```bash
-python batch_e_reporter.py gs://my-bucket/results/ -o report.html
+python batch_e_reporter.py gs://bucket/results/ -o report.html
 ```
+
+### Via WDL on Terra (hailrunner)
+
+The pipeline can be run as a WDL workflow on Terra, using [hailrunner](https://github.com/broadinstitute/hailrunner) to manage ephemeral Dataproc clusters. The workflow runs analysis on Dataproc and generates an HTML report in a lightweight follow-up task.
+
+Import the workflow from [Dockstore](https://dockstore.org/) or directly from `wdl/batch_e.wdl`.
+
+Example input JSON:
+
+```json
+{
+    "batch_e.ancestry_tsv": "gs://bucket/ancestry.tsv",
+    "batch_e.comparison_tsv": "gs://bucket/site_labels.tsv",
+    "batch_e.comparison_col": "site_id",
+    "batch_e.comparison_name": "sequencing_center",
+    "batch_e.intervals": [
+        {"name": "ACMG59", "path": "gs://bucket/intervals/acmg59.bed"},
+        {"name": "Low_Mappability", "path": "gs://bucket/intervals/lowmap.bed.gz"}
+    ],
+    "batch_e.output_dir": "gs://staging-bucket/batch_effect_results/run_001",
+    "batch_e.mt_path": "gs://bucket/data.mt/",
+    "batch_e.ancestries": ["eur", "afr", "amr"],
+    "batch_e.samples_per_group": "5000",
+    "batch_e.staging_bucket": "gs://staging-bucket",
+    "batch_e.workers": 32
+}
+```
+
+## Configuration
+
+### Required Parameters
+
+| Parameter | Description |
+|-----------|-------------|
+| `ancestry_tsv` | Path to TSV with sample ancestry predictions |
+| `comparison_tsv` | Path to TSV with comparison group labels |
+| `comparison_col` | Column name for the grouping variable |
+| `interval_dict` | Dict of interval name → BED file path (non-empty) |
+
+### Optional Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `comparison_name` | `comparison_col` | Human-readable label for the comparison |
+| `ancestry_col` | `ancestry_pred_other` | Column name for ancestry in ancestry TSV |
+| `sample_id_col` | `research_id` | Sample ID column shared across all TSVs |
+| `ancestries` | all | Ancestries to include |
+| `comparison_values` | all | Comparison group values to include |
+| `samples_per_group` | None (all) | Max samples per (group, ancestry) |
+| `data_source` | `vcf` | `"vcf"` or `"mt"` (pre-built MatrixTable) |
+| `filter_to_pass` | True | Keep only PASS variants |
+| `filter_FT_pass` | True | Set GT to missing unless FT contains PASS |
+| `pruning_subsample_n` | 50,000 | Subsample large interval lists for partition pruning |
 
 ## Metrics
 
@@ -104,18 +154,22 @@ python batch_e_reporter.py gs://my-bucket/results/ -o report.html
 - matplotlib, seaborn (for reporting)
 - gcsfs (for GCS access)
 
-Designed to run on Google Cloud Dataproc via [Terra](https://terra.bio/).
+Designed to run on Google Cloud Dataproc via [Terra](https://terra.bio/) or via [hailrunner](https://github.com/broadinstitute/hailrunner).
 
 ## Project Structure
 
 ```
 .
-├── batch_e.py              # Main pipeline
-├── batch_e_reporter.py     # HTML report generator
-└── intervals/
-    ├── *.bed               # Genomic interval files
-    ├── scripts/            # Interval download and processing utilities
-    └── downsample_report/  # Interval downsampling analysis
+├── batch_e/
+│   ├── batch_e.py              # Main pipeline
+│   └── batch_e_reporter.py     # HTML report generator
+├── wdl/
+│   └── batch_e.wdl             # WDL workflow (hailrunner + reporter)
+├── intervals/
+│   ├── *.bed.gz                # Genomic interval files
+│   ├── scripts/                # Interval download and processing utilities
+│   └── downsample_report/      # Interval downsampling analysis
+└── .dockstore.yml              # Dockstore workflow registration
 ```
 
 ## License

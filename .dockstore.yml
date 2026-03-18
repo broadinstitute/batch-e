@@ -1,0 +1,7 @@
+version: 1.2
+
+workflows:
+  - name: batch-e
+    subclass: WDL
+    primaryDescriptorPath: /wdl/batch_e.wdl
+    topic: Batch effect analysis on WGS data with Hail on ephemeral Dataproc

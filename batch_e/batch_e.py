@@ -1,34 +1,41 @@
 #!/usr/bin/env python3
 """
-Batch Effect Analysis Pipeline for AoU WGS Data
+Batch Effect Analysis Pipeline
 
-A modular pipeline for measuring sequencing center batch effects in VCF data.
-Supports multiple run modes (smoke, dev, medium, full) and both within-ancestry
-and pooled analysis strategies.
+A general-purpose pipeline for measuring group-level batch effects in VCF/MT
+data. Compares a user-supplied grouping variable (e.g., sequencing center,
+instrument, lab) across genomic interval classes, stratified by genetic ancestry.
 
 Usage in notebook:
-    # Paste this code into a cell, then:
     cfg = PipelineConfig(
-        mode='dev',
-        ancestries=['eur', 'afr'],
-        batches=['bcm_v8_delta', 'bi_v8_delta'],
+        data_source='mt',
+        hail_mt_path='gs://bucket/data.mt/',
+        ancestry_tsv='gs://bucket/ancestry.tsv',
+        comparison_tsv='gs://bucket/labels.tsv',
+        comparison_col='site_id',
+        interval_dict={'ACMG59': 'gs://bucket/acmg59.bed'},
     )
     results = run_pipeline(cfg)
 
 Usage from command line:
-    python batch_effect_pipeline.py --mode dev --output-dir gs://bucket/results/
+    python batch_e.py \
+        --data-source mt --mt-path gs://bucket/data.mt/ \
+        --ancestry-tsv gs://bucket/ancestry.tsv \
+        --comparison-tsv gs://bucket/labels.tsv \
+        --comparison-col site_id \
+        --interval ACMG59=gs://bucket/acmg59.bed \
+        --output-dir gs://bucket/results/
 """
 
 from __future__ import annotations
 
-import os
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
-from enum import Enum
 
 import numpy as np
 import pandas as pd
@@ -40,15 +47,15 @@ hl = None
 def _init_hail():
     """Initialize Hail with proper Spark configuration."""
     import hail as hl
-    
+
     # Configure Spark for large broadcast variables
     spark_conf = {
         'spark.rpc.message.maxSize': '1024',  # 1GB instead of 512MB
         'spark.driver.maxResultSize': '8g',
     }
-    
+
     hl.init(
-        default_reference='GRCh38', 
+        default_reference='GRCh38',
         idempotent=True,
         spark_conf=spark_conf
     )
@@ -58,25 +65,16 @@ def _init_hail():
 # Configuration
 # =============================================================================
 
-class RunMode(Enum):
-    """Pipeline run modes with different scale/speed tradeoffs."""
-    SMOKE = "smoke"      # ~100 samples, 1 interval - catch syntax errors
-    DEV = "dev"          # ~1000 samples, 2 intervals - catch logic errors
-    MEDIUM = "medium"    # ~5000 samples, all intervals - catch scaling issues
-    FULL = "full"        # All samples, all intervals - production
-
-
 @dataclass
 class PipelineConfig:
     """Configuration for batch effect analysis pipeline."""
-    
+
     # Run identification
     run_name: Optional[str] = None
-    mode: str = "dev"  # smoke, dev, medium, full - controls variant filtering only
-    
+
     # Sample subsetting
     samples_per_group: Optional[int] = None  # None = all samples (no subsampling)
-        
+
     # Data source
     data_source: str = "vcf"          # "vcf" (primary) or "mt" (fast path using pre-built MT)
     vcf_path: Optional[str] = None    # glob pattern, e.g., "gs://.../*.vcf.bgz"
@@ -88,109 +86,72 @@ class PipelineConfig:
     acaf_min_af: float = 0.01
     acaf_min_ac: int = 100
 
-    # Caching (VCF import → MT for reuse)
+    # Caching (VCF import -> MT for reuse)
     cache_mt: bool = True              # write imported VCF as MT for reuse
     cache_mt_path: Optional[str] = None  # auto-generated if None
     force_reimport: bool = False       # ignore cache, re-import from VCF
 
-    # Other data paths (defaults from environment)
-    workspace_bucket: Optional[str] = None
-    metadata_path: Optional[str] = None
-    
-    # Batch and stratification
-    batch_col: str = "batch"
-    ancestry_col: str = "ancestry_pred_other"
+    # Sample ID column (shared across all TSVs)
     sample_id_col: str = "research_id"
-    
-    # Which batches and ancestries to include
-    batches: Optional[List[str]] = None  # None = all
-    ancestries: Optional[List[str]] = None  # None = all
-    
-    # Analysis parameters
-    analysis_strategy: str = "within_ancestry"  # "within_ancestry" or "pooled"
-    min_samples_per_group: int = 50  # Skip groups with fewer samples
-    
-    # Interval lists for stratified analysis
-    interval_dict: Optional[Dict[str, str]] = None  # Auto-populated if None
-    pruning_subsample_n: Optional[int] = 50_000  # Subsample large interval lists for partition pruning (None = no subsampling). Annotation always uses full intervals.
 
-    # Sampling parameters (for non-full modes)
-    samples_per_group: Optional[int] = None  # Auto-set based on mode
+    # Ancestry configuration
+    ancestry_tsv: Optional[str] = None   # required — path to ancestry predictions TSV
+    ancestry_col: str = "ancestry_pred_other"  # column in ancestry TSV
+    ancestries: Optional[List[str]] = None  # filter; None = all
+
+    # Comparison group configuration
+    comparison_tsv: Optional[str] = None   # required — path to comparison grouping TSV
+    comparison_col: Optional[str] = None   # required — column name for the grouping variable
+    comparison_name: Optional[str] = None  # human label (defaults to comparison_col)
+    comparison_values: Optional[List[str]] = None  # filter; None = all
+
+    # Analysis parameters
+    min_samples_per_group: int = 50  # Skip groups with fewer samples
+
+    # Interval lists for stratified analysis
+    interval_dict: Optional[Dict[str, str]] = None  # required — no defaults
+    pruning_subsample_n: Optional[int] = 50_000  # Subsample large interval lists for partition pruning
+
+    # Sampling parameters
     random_seed: int = 42
-    
+
     # Variant filtering
     filter_to_pass: bool = True  # Keep only PASS variants
     filter_FT_pass: bool = True  # Set GT to missing unless FT contains PASS
-    
+
     # Output control
     output_dir: Optional[str] = None
     export_per_sample: bool = False  # Large output, off by default
     export_sampled_per_sample: bool = True
     sampled_per_sample_n: int = 2000
-    
+
     # Compute parameters
     hail_min_partitions: int = 1000
-    
+
     def __post_init__(self):
-        """Set defaults based on mode and environment."""
-        # Resolve environment variables
-        if self.workspace_bucket is None:
-            self.workspace_bucket = os.environ.get('WORKSPACE_BUCKET', '')
-        
-        if self.metadata_path is None:
-            self.metadata_path = f"{self.workspace_bucket}/batchE_tables/sample_metadata.tsv"
-        
-        if self.vcf_path is None:
-            self.vcf_path = os.environ.get('WGS_ACAF_THRESHOLD_VCF_PATH', '')
+        """Validate required fields and set defaults."""
+        # Validate required fields
+        if not self.ancestry_tsv:
+            raise ValueError("ancestry_tsv is required (path to ancestry predictions TSV)")
+        if not self.comparison_tsv:
+            raise ValueError("comparison_tsv is required (path to comparison grouping TSV)")
+        if not self.comparison_col:
+            raise ValueError("comparison_col is required (column name for the grouping variable)")
+        if not self.interval_dict:
+            raise ValueError("interval_dict is required and must be non-empty (dict of name -> BED path)")
 
-        if self.hail_mt_path is None:
-            self.hail_mt_path = os.environ.get('WGS_ACAF_THRESHOLD_SPLIT_HAIL_PATH', '')
+        # Default comparison_name to comparison_col
+        if self.comparison_name is None:
+            self.comparison_name = self.comparison_col
 
-        if self.cache_mt_path is None:
-            self.cache_mt_path = f"{self.workspace_bucket}/batch_effect_cache/imported.mt"
-
-        # Set default samples_per_group based on mode if not explicitly provided
-        if self.samples_per_group is None:
-            mode_defaults = {
-                "smoke": 100,
-                "dev": 1000,
-                "medium": 5000,
-                "full": 10000,  # Even "full" mode defaults to 10k per group
-            }
-            self.samples_per_group = mode_defaults.get(self.mode, 5000)
-    
         # Generate run name
         if self.run_name is None:
             timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-            self.run_name = f"batche_{self.mode}_{timestamp}"
-        
+            self.run_name = f"batche_{timestamp}"
+
         # Set output directory
         if self.output_dir is None:
-            self.output_dir = f"{self.workspace_bucket}/batch_effect_results/{self.run_name}"
-        
-        # Default interval dict
-        if self.interval_dict is None:
-            self.interval_dict = self._default_interval_dict()
-        
-        # Adjust intervals for smaller modes
-        if self.mode == "smoke":
-            # Just use one small interval
-            self.interval_dict = {"ACMG59": self.interval_dict.get("ACMG59", list(self.interval_dict.values())[0])}
-        elif self.mode == "dev":
-            # Use two intervals
-            keys = list(self.interval_dict.keys())[:2]
-            self.interval_dict = {k: self.interval_dict[k] for k in keys}
-    
-    def _default_interval_dict(self) -> Dict[str, str]:
-        """Default genomic interval lists for analysis."""
-        bucket = os.environ.get('WORKSPACE_BUCKET', '')
-        return {
-            "ACMG59": f"{bucket}/interval_lists/acmg59_allofus_19dec2019.GRC38.wGenes.NEW.bed",
-            "Low_Mappability": f"{bucket}/interval_lists/GRCh38_lowmappabilityall.bed.gz",
-            "GC_gt_85": f"{bucket}/interval_lists/GRCh38_gc85_slop50.bed.gz",
-            "GC_lt_25": f"{bucket}/interval_lists/GRCh38_gclt25_merged.bed",
-            "HighConf_Genome": f"{bucket}/interval_lists/giab_highconf_wgs_calling_regions_hg38_intersection.bed",
-        }
+            self.output_dir = f"batch_effect_results/{self.run_name}"
 
 
 # =============================================================================
@@ -216,22 +177,21 @@ def log_cluster_info(logger: logging.Logger) -> Dict[str, Any]:
     try:
         from pyspark import SparkContext
         sc = SparkContext.getOrCreate()
-        
+
         conf = sc.getConf()
-        
+
         # Get executor info
         executor_memory = conf.get("spark.executor.memory", "unknown")
         executor_cores = conf.get("spark.executor.cores", "unknown")
         driver_memory = conf.get("spark.driver.memory", "unknown")
-        
+
         # Get number of executors (this is the actual count of active executors)
-        # _jsc.sc().getExecutorMemoryStatus() returns a map of executor -> memory
         executor_status = sc._jsc.sc().getExecutorMemoryStatus()
         num_executors = executor_status.size() - 1  # subtract 1 for driver
-        
+
         # Default parallelism
         parallelism = sc.defaultParallelism
-        
+
         cluster_info = {
             'num_executors': num_executors,
             'executor_memory': executor_memory,
@@ -241,7 +201,7 @@ def log_cluster_info(logger: logging.Logger) -> Dict[str, Any]:
             'app_name': sc.appName,
             'master': sc.master,
         }
-        
+
         logger.info("=" * 60)
         logger.info("SPARK CLUSTER INFO")
         logger.info("=" * 60)
@@ -252,39 +212,32 @@ def log_cluster_info(logger: logging.Logger) -> Dict[str, Any]:
         logger.info(f"  Default parallelism: {parallelism}")
         logger.info(f"  Total cores:         ~{num_executors * int(executor_cores) if executor_cores != 'unknown' else 'unknown'}")
         logger.info("=" * 60)
-        
+
         return cluster_info
-        
+
     except Exception as e:
         logger.warning(f"Could not get cluster info: {e}")
         return {'error': str(e)}
 
 
 def collect_spark_metrics(logger: logging.Logger) -> Dict[str, Any]:
-    """Collect Spark metrics after computation completes.
-
-    Uses the Java SparkContext API directly since the PySpark StatusTracker
-    has limited methods in Spark 3.5.x.
-    """
+    """Collect Spark metrics after computation completes."""
     metrics = {}
     try:
         from pyspark import SparkContext
         sc = SparkContext.getOrCreate()
 
-        # Executor count (subtract 1 for driver)
         try:
             status = sc._jsc.sc().getExecutorMemoryStatus()
             metrics['num_executors_at_completion'] = status.size() - 1
         except Exception:
             pass
 
-        # Default parallelism (reflects actual cluster capacity)
         try:
             metrics['default_parallelism'] = sc.defaultParallelism
         except Exception:
             pass
 
-        # Application ID for cross-referencing with Spark UI / YARN logs
         try:
             metrics['application_id'] = sc.applicationId
         except Exception:
@@ -314,81 +267,122 @@ def get_gcs_filesystem() -> gcsfs.GCSFileSystem:
     return gcsfs.GCSFileSystem(project=project, requester_pays=True)
 
 
-def load_metadata(cfg: PipelineConfig, logger: logging.Logger) -> pd.DataFrame:
-    """Load and filter sample metadata."""
-    logger.info(f"Loading metadata from {cfg.metadata_path}")
-    
-    fs = get_gcs_filesystem()
-    path = cfg.metadata_path.replace('gs://', '')
-    
-    with fs.open(path, 'r') as f:
-        df = pd.read_csv(f, sep='\t')
-    
+def _read_tsv(path: str) -> pd.DataFrame:
+    """Read a TSV from GCS or local filesystem."""
+    if path.startswith('gs://'):
+        fs = get_gcs_filesystem()
+        with fs.open(path.replace('gs://', ''), 'r') as f:
+            return pd.read_csv(f, sep='\t')
+    return pd.read_csv(path, sep='\t')
+
+
+def load_ancestry(cfg: PipelineConfig, logger: logging.Logger) -> pd.DataFrame:
+    """Load ancestry TSV. Return DataFrame with [sample_id_col, 'ancestry']."""
+    logger.info(f"Loading ancestry from {cfg.ancestry_tsv}")
+
+    df = _read_tsv(cfg.ancestry_tsv)
     df[cfg.sample_id_col] = df[cfg.sample_id_col].astype(str)
-    logger.info(f"Loaded {len(df)} samples")
-    
-    # Filter to requested batches
-    if cfg.batches is not None:
-        df = df[df[cfg.batch_col].isin(cfg.batches)]
-        logger.info(f"Filtered to batches {cfg.batches}: {len(df)} samples")
-    
+
+    # Rename ancestry column to canonical 'ancestry'
+    if cfg.ancestry_col != 'ancestry':
+        df = df.rename(columns={cfg.ancestry_col: 'ancestry'})
+
+    df = df[[cfg.sample_id_col, 'ancestry']]
+    logger.info(f"Loaded ancestry for {len(df)} samples ({df['ancestry'].nunique()} groups)")
+
+    return df
+
+
+def load_comparison(cfg: PipelineConfig, logger: logging.Logger) -> pd.DataFrame:
+    """Load comparison TSV. Return DataFrame with [sample_id_col, comparison_name]."""
+    logger.info(f"Loading comparison groups from {cfg.comparison_tsv}")
+
+    df = _read_tsv(cfg.comparison_tsv)
+    df[cfg.sample_id_col] = df[cfg.sample_id_col].astype(str)
+
+    # Rename comparison column to comparison_name
+    if cfg.comparison_col != cfg.comparison_name:
+        df = df.rename(columns={cfg.comparison_col: cfg.comparison_name})
+
+    df = df[[cfg.sample_id_col, cfg.comparison_name]]
+    logger.info(f"Loaded comparison groups for {len(df)} samples ({df[cfg.comparison_name].nunique()} groups)")
+
+    return df
+
+
+def merge_metadata(
+    ancestry_df: pd.DataFrame,
+    comparison_df: pd.DataFrame,
+    cfg: PipelineConfig,
+    logger: logging.Logger,
+) -> pd.DataFrame:
+    """Inner join ancestry and comparison on sample_id_col. Apply filters."""
+    n_ancestry = len(ancestry_df)
+    n_comparison = len(comparison_df)
+
+    df = ancestry_df.merge(comparison_df, on=cfg.sample_id_col, how='inner')
+    n_merged = len(df)
+    n_dropped = max(n_ancestry, n_comparison) - n_merged
+    logger.info(f"Merged metadata: {n_merged} samples ({n_dropped} dropped in join)")
+
     # Filter to requested ancestries
     if cfg.ancestries is not None:
-        df = df[df[cfg.ancestry_col].isin(cfg.ancestries)]
+        df = df[df['ancestry'].isin(cfg.ancestries)]
         logger.info(f"Filtered to ancestries {cfg.ancestries}: {len(df)} samples")
-    
+
+    # Filter to requested comparison values
+    if cfg.comparison_values is not None:
+        df = df[df[cfg.comparison_name].isin(cfg.comparison_values)]
+        logger.info(f"Filtered to {cfg.comparison_name} values {cfg.comparison_values}: {len(df)} samples")
+
+    # Log sample counts
+    group_counts = df.groupby(['ancestry', cfg.comparison_name]).size()
+    logger.info(f"Sample counts by group:\n{group_counts.to_string()}")
+
     return df
 
 
 def subsample_metadata(
-    df: pd.DataFrame, 
-    cfg: PipelineConfig, 
+    df: pd.DataFrame,
+    cfg: PipelineConfig,
     logger: logging.Logger
 ) -> pd.DataFrame:
-    """Subsample metadata for non-full runs."""
+    """Subsample metadata to samples_per_group per (comparison, ancestry) group."""
     if cfg.samples_per_group is None:
         logger.info("No subsampling: using all samples")
         return df
-    
-    logger.info(f"Subsampling to {cfg.samples_per_group} per (batch, ancestry) group")
-    
+
+    logger.info(f"Subsampling to {cfg.samples_per_group} per ({cfg.comparison_name}, ancestry) group")
+
     rng = np.random.RandomState(cfg.random_seed)
     groups = []
-    
-    for (batch, ancestry), group_df in df.groupby([cfg.batch_col, cfg.ancestry_col]):
+
+    for (comp_val, ancestry), group_df in df.groupby([cfg.comparison_name, 'ancestry']):
         n = len(group_df)
         k = min(cfg.samples_per_group, n)
         if k < cfg.min_samples_per_group:
-            logger.warning(f"Skipping ({batch}, {ancestry}): only {n} samples")
+            logger.warning(f"Skipping ({comp_val}, {ancestry}): only {n} samples")
             continue
         idx = rng.choice(n, size=k, replace=False)
         groups.append(group_df.iloc[idx])
-    
+
     if not groups:
         raise ValueError("No groups with sufficient samples after filtering")
-    
+
     subsampled = pd.concat(groups, ignore_index=True)
     logger.info(f"Subsampled to {len(subsampled)} total samples")
-    
+
     # Log group sizes
-    group_counts = subsampled.groupby([cfg.batch_col, cfg.ancestry_col]).size()
+    group_counts = subsampled.groupby([cfg.comparison_name, 'ancestry']).size()
     logger.info(f"Group sizes:\n{group_counts.to_string()}")
-    
+
     return subsampled
 
 # =============================================================================
 # Hail Operations
 # =============================================================================
 def import_from_vcf(cfg: PipelineConfig, logger: logging.Logger):
-    """Import VCFs, split multi-allelics, optionally apply ACAF filter.
-
-    Args:
-        cfg: Pipeline configuration with vcf_path, split_multi, acaf_filter settings.
-        logger: Logger instance.
-
-    Returns:
-        Hail MatrixTable with biallelic variants ready for downstream processing.
-    """
+    """Import VCFs, split multi-allelics, optionally apply ACAF filter."""
     hl = _init_hail()
 
     logger.info(f"Importing VCFs from {cfg.vcf_path}")
@@ -405,7 +399,6 @@ def import_from_vcf(cfg: PipelineConfig, logger: logging.Logger):
         logger.info("Split multi-allelic sites")
 
     if cfg.acaf_filter:
-        # INFO/AC and INFO/AF field names may vary — verify against VCF header
         mt = mt.filter_rows(
             (hl.max(mt.info.AF) > cfg.acaf_min_af) |
             (hl.max(mt.info.AC) > cfg.acaf_min_ac)
@@ -421,9 +414,6 @@ def load_and_filter_mt(
     logger: logging.Logger
 ) -> Tuple[Any, Dict[str, Any]]:
     """Load variant data (from VCF or pre-built MT), filter, and return interval tables.
-
-    When data_source="vcf": imports from VCF, checks for cached MT first.
-    When data_source="mt": reads pre-built MT directly (legacy fast path).
 
     Returns:
         Tuple of (filtered MatrixTable, dict of interval Hail Tables for annotation).
@@ -472,63 +462,53 @@ def load_and_filter_mt(
     interval_tables = {}
     all_intervals_for_pruning = []
 
-    if cfg.interval_dict:
-        for name, path in cfg.interval_dict.items():
-            logger.info(f"Loading interval list: {name}")
-            is_gzipped = path.endswith('.gz')
+    for name, path in cfg.interval_dict.items():
+        logger.info(f"Loading interval list: {name}")
+        is_gzipped = path.endswith('.gz')
 
-            try:
-                if '.interval_list' in path:
-                    interval_table = hl.import_locus_intervals(
-                        path, reference_genome='GRCh38',
-                        force_bgz=is_gzipped, filter=r'^(#|@)'
-                    )
-                else:
-                    interval_table = hl.import_bed(
-                        path, reference_genome='GRCh38',
-                        force_bgz=is_gzipped,
-                        skip_invalid_intervals=True,
-                        filter=r'^#'
-                    )
+        try:
+            if '.interval_list' in path:
+                interval_table = hl.import_locus_intervals(
+                    path, reference_genome='GRCh38',
+                    force_bgz=is_gzipped, filter=r'^(#|@)'
+                )
+            else:
+                interval_table = hl.import_bed(
+                    path, reference_genome='GRCh38',
+                    force_bgz=is_gzipped,
+                    skip_invalid_intervals=True,
+                    filter=r'^#'
+                )
 
-                # Keep the table for annotation later
-                interval_tables[name] = interval_table
+            # Keep the table for annotation later
+            interval_tables[name] = interval_table
 
-                # Collect intervals for partition pruning
-                intervals = interval_table.interval.collect()
-                logger.info(f"  {name}: {len(intervals)} intervals")
+            # Collect intervals for partition pruning
+            intervals = interval_table.interval.collect()
+            logger.info(f"  {name}: {len(intervals)} intervals")
 
-                # Subsample HighConf_Genome if configured
-                if cfg.pruning_subsample_n is not None and len(intervals) > cfg.pruning_subsample_n:
-                    rng = np.random.RandomState(cfg.random_seed)
-                    idx = rng.choice(len(intervals), size=cfg.pruning_subsample_n, replace=False)
-                    intervals = [intervals[i] for i in sorted(idx)]
-                    logger.info(f"  Subsampled {name} to {len(intervals)} intervals for pruning")
+            # Subsample large interval lists for partition pruning
+            if cfg.pruning_subsample_n is not None and len(intervals) > cfg.pruning_subsample_n:
+                rng = np.random.RandomState(cfg.random_seed)
+                idx = rng.choice(len(intervals), size=cfg.pruning_subsample_n, replace=False)
+                intervals = [intervals[i] for i in sorted(idx)]
+                logger.info(f"  Subsampled {name} to {len(intervals)} intervals for pruning")
 
-                all_intervals_for_pruning.append(intervals)
+            all_intervals_for_pruning.append(intervals)
 
-            except Exception as e:
-                logger.warning(f"  Failed to load {name}: {e}")
-                continue
+        except Exception as e:
+            logger.warning(f"  Failed to load {name}: {e}")
+            continue
 
-        # Flatten all intervals and apply partition pruning
-        flat_intervals = [iv for sublist in all_intervals_for_pruning for iv in sublist]
-        logger.info(f"Total: {len(flat_intervals)} intervals for partition pruning")
+    # Flatten all intervals and apply partition pruning
+    flat_intervals = [iv for sublist in all_intervals_for_pruning for iv in sublist]
+    logger.info(f"Total: {len(flat_intervals)} intervals for partition pruning")
 
-        if flat_intervals:
-            partitions_before = mt.n_partitions()
-            mt = hl.filter_intervals(mt, flat_intervals, keep=True)
-            partitions_after = mt.n_partitions()
-            logger.info(f"Partition pruning: {partitions_before} → {partitions_after} partitions ({partitions_before - partitions_after} pruned)")
-
-    # For smoke/dev mode, additionally filter to specific chromosomes
-    if cfg.mode == 'smoke':
-        mt = mt.filter_rows(mt.locus.contig == 'chr17')
-        logger.info("SMOKE MODE: Filtered to chr17 only")
-    elif cfg.mode == 'dev':
-        dev_chroms = {'chr7', 'chr17', 'chr13'}
-        mt = mt.filter_rows(hl.literal(dev_chroms).contains(mt.locus.contig))
-        logger.info(f"DEV MODE: Filtered to {dev_chroms}")
+    if flat_intervals:
+        partitions_before = mt.n_partitions()
+        mt = hl.filter_intervals(mt, flat_intervals, keep=True)
+        partitions_after = mt.n_partitions()
+        logger.info(f"Partition pruning: {partitions_before} -> {partitions_after} partitions ({partitions_before - partitions_after} pruned)")
 
     # Apply variant filters
     if cfg.filter_to_pass:
@@ -548,33 +528,29 @@ def load_and_filter_mt(
     return mt, interval_tables
 
 
-# NOTE: load_interval_tables() has been merged into load_and_filter_mt()
-# to avoid loading interval BED files twice. Interval tables are now
-# returned as the second element of load_and_filter_mt()'s return tuple.
-
 def annotate_mt_with_metadata(
     mt,
     metadata: pd.DataFrame,
     cfg: PipelineConfig,
     logger: logging.Logger
 ):
-    """Annotate MatrixTable columns with batch and ancestry labels."""
+    """Annotate MatrixTable columns with ancestry and comparison group labels."""
     hl = _init_hail()
-    
+
     logger.info("Annotating MT with sample metadata")
-    
+
     # Create Hail table from metadata
     meta_ht = hl.Table.from_pandas(metadata[[
-        cfg.sample_id_col, cfg.batch_col, cfg.ancestry_col
+        cfg.sample_id_col, 'ancestry', cfg.comparison_name
     ]])
     meta_ht = meta_ht.key_by(cfg.sample_id_col)
-    
+
     # Annotate MT columns
     mt = mt.annotate_cols(
-        batch=meta_ht[mt.s][cfg.batch_col],
-        ancestry=meta_ht[mt.s][cfg.ancestry_col]
+        ancestry=meta_ht[mt.s]['ancestry'],
+        **{cfg.comparison_name: meta_ht[mt.s][cfg.comparison_name]}
     )
-    
+
     return mt
 
 
@@ -589,14 +565,7 @@ def compute_variant_stats(
 
     Uses hl.agg.explode + hl.agg.group_by to produce compact JVM bytecode.
     This avoids the 64KB method size limit that occurs when unrolling
-    N intervals × 8 aggregators into separate hl.agg.filter blocks.
-
-    Args:
-        mt: MatrixTable with GT entry field and locus row key.
-        interval_tables: Dict mapping interval name to Hail Table (keyed by locus interval).
-
-    Returns:
-        MT with `interval_stats` column: dict<str, struct<8 counters>> per sample.
+    N intervals x 8 aggregators into separate hl.agg.filter blocks.
     """
     hl = _init_hail()
 
@@ -616,7 +585,7 @@ def compute_variant_stats(
     is_het = mt.GT.is_het()
     is_hom = mt.GT.is_hom_var()
 
-    # Single aggregation — group_by dispatches at runtime, not compile time
+    # Single aggregation -- group_by dispatches at runtime, not compile time
     mt = mt.annotate_cols(
         interval_stats=hl.agg.explode(
             lambda iv: hl.agg.group_by(iv, hl.struct(
@@ -663,8 +632,8 @@ def extract_sample_stats(mt, cfg: PipelineConfig, logger: logging.Logger) -> pd.
     # Build selection
     select_exprs = {
         's': cols_ht.s,
-        'batch': cols_ht.batch,
         'ancestry': cols_ht.ancestry,
+        cfg.comparison_name: cols_ht[cfg.comparison_name],
     }
 
     stat_fields = [
@@ -693,38 +662,38 @@ def extract_sample_stats(mt, cfg: PipelineConfig, logger: logging.Logger) -> pd.
 def compute_derived_metrics(df: pd.DataFrame, cfg: PipelineConfig) -> pd.DataFrame:
     """Compute derived metrics (Ti/Tv ratio, del/ins ratio, etc.)."""
     df = df.copy()
-    
+
     for interval in cfg.interval_dict.keys():
         prefix = interval
-        
+
         # SNP counts
         df[f"{prefix}_snp_het"] = df[f"{prefix}_snp_ti_het"] + df[f"{prefix}_snp_tv_het"]
         df[f"{prefix}_snp_hom"] = df[f"{prefix}_snp_ti_hom"] + df[f"{prefix}_snp_tv_hom"]
         df[f"{prefix}_snp_total"] = df[f"{prefix}_snp_het"] + df[f"{prefix}_snp_hom"]
-        
+
         # Ti/Tv ratios
         tv_het = df[f"{prefix}_snp_tv_het"].replace(0, np.nan)
         tv_hom = df[f"{prefix}_snp_tv_hom"].replace(0, np.nan)
         tv_total = (df[f"{prefix}_snp_tv_het"] + df[f"{prefix}_snp_tv_hom"]).replace(0, np.nan)
-        
+
         df[f"{prefix}_titv_het"] = df[f"{prefix}_snp_ti_het"] / tv_het
         df[f"{prefix}_titv_hom"] = df[f"{prefix}_snp_ti_hom"] / tv_hom
         df[f"{prefix}_titv_total"] = (df[f"{prefix}_snp_ti_het"] + df[f"{prefix}_snp_ti_hom"]) / tv_total
-        
+
         # Indel counts
         df[f"{prefix}_indel_het"] = df[f"{prefix}_indel_ins_het"] + df[f"{prefix}_indel_del_het"]
         df[f"{prefix}_indel_hom"] = df[f"{prefix}_indel_ins_hom"] + df[f"{prefix}_indel_del_hom"]
         df[f"{prefix}_indel_total"] = df[f"{prefix}_indel_het"] + df[f"{prefix}_indel_hom"]
-        
+
         # Del/Ins ratios
         ins_het = df[f"{prefix}_indel_ins_het"].replace(0, np.nan)
         ins_hom = df[f"{prefix}_indel_ins_hom"].replace(0, np.nan)
         ins_total = (df[f"{prefix}_indel_ins_het"] + df[f"{prefix}_indel_ins_hom"]).replace(0, np.nan)
-        
+
         df[f"{prefix}_delins_het"] = df[f"{prefix}_indel_del_het"] / ins_het
         df[f"{prefix}_delins_hom"] = df[f"{prefix}_indel_del_hom"] / ins_hom
         df[f"{prefix}_delins_total"] = (df[f"{prefix}_indel_del_het"] + df[f"{prefix}_indel_del_hom"]) / ins_total
-    
+
     return df
 
 
@@ -733,27 +702,24 @@ def compute_group_summaries(
     cfg: PipelineConfig,
     logger: logging.Logger
 ) -> pd.DataFrame:
-    """Compute mean/std for each metric by batch (and optionally ancestry)."""
-    
-    # Identify metric columns (everything except s, batch, ancestry)
-    id_cols = ['s', 'batch', 'ancestry']
+    """Compute mean/std for each metric by comparison group and ancestry."""
+
+    # Identify metric columns (everything except s, ancestry, comparison)
+    id_cols = {'s', 'ancestry', cfg.comparison_name}
     metric_cols = [c for c in df.columns if c not in id_cols]
-    
-    if cfg.analysis_strategy == "within_ancestry":
-        group_cols = ['batch', 'ancestry']
-    else:
-        group_cols = ['batch']
-    
+
+    group_cols = ['ancestry', cfg.comparison_name]
+
     logger.info(f"Computing summaries grouped by {group_cols}")
-    
+
     # Compute aggregations
     agg_funcs = ['mean', 'std', 'count']
     summary = df.groupby(group_cols)[metric_cols].agg(agg_funcs)
-    
+
     # Flatten column names
     summary.columns = ['_'.join(col).strip() for col in summary.columns]
     summary = summary.reset_index()
-    
+
     return summary
 
 
@@ -762,46 +728,43 @@ def compute_pairwise_comparisons(
     cfg: PipelineConfig,
     logger: logging.Logger
 ) -> pd.DataFrame:
-    """Compute pairwise batch comparisons (effect sizes and p-values)."""
+    """Compute pairwise comparisons between groups (effect sizes and p-values).
+
+    Always stratified by ancestry. Output uses 'group_x'/'group_y' columns
+    with a 'comparison' column indicating the comparison variable name.
+    """
     from scipy import stats as scipy_stats
-    
-    batches = df['batch'].unique()
-    
-    if cfg.analysis_strategy == "within_ancestry":
-        ancestries = df['ancestry'].unique()
-    else:
-        ancestries = [None]
-    
+
+    comp_values = df[cfg.comparison_name].unique()
+    ancestries = df['ancestry'].unique()
+
     # Focus on key derived metrics
     key_metrics = [c for c in df.columns if c.endswith(('_snp_total', '_indel_total', '_titv_total', '_delins_total'))]
-    
+
     logger.info(f"Computing comparisons for metrics: {key_metrics}")
-    
+
     results = []
-    
+
     for ancestry in ancestries:
-        if ancestry is not None:
-            sub_df = df[df['ancestry'] == ancestry]
-        else:
-            sub_df = df
-        
-        for i, batch_x in enumerate(batches):
-            for batch_y in list(batches)[i+1:]:
-                x_data = sub_df[sub_df['batch'] == batch_x]
-                y_data = sub_df[sub_df['batch'] == batch_y]
-                
+        sub_df = df[df['ancestry'] == ancestry]
+
+        for i, group_x in enumerate(comp_values):
+            for group_y in list(comp_values)[i+1:]:
+                x_data = sub_df[sub_df[cfg.comparison_name] == group_x]
+                y_data = sub_df[sub_df[cfg.comparison_name] == group_y]
+
                 if len(x_data) < cfg.min_samples_per_group or len(y_data) < cfg.min_samples_per_group:
                     continue
-                
+
                 for metric in key_metrics:
                     # Convert to numpy float64 arrays explicitly
                     x_vals = pd.to_numeric(x_data[metric], errors='coerce').astype('float64').dropna().values
                     y_vals = pd.to_numeric(y_data[metric], errors='coerce').astype('float64').dropna().values
-                    
+
                     if len(x_vals) < 10 or len(y_vals) < 10:
-                        logger.warning(f"Skipping {metric} for {batch_x} vs {batch_y}: insufficient data")
+                        logger.warning(f"Skipping {metric} for {group_x} vs {group_y}: insufficient data")
                         continue
-                    
+
                     mean_x, std_x = x_vals.mean(), x_vals.std()
                     mean_y, std_y = y_vals.mean(), y_vals.std()
                     n_x, n_y = len(x_vals), len(y_vals)
@@ -811,18 +774,19 @@ def compute_pairwise_comparisons(
                         ((n_x - 1) * std_x**2 + (n_y - 1) * std_y**2) / (n_x + n_y - 2)
                     )
                     cohens_d = (mean_x - mean_y) / pooled_std if pooled_std > 0 else np.nan
-                    
+
                     # Welch's t-test
                     try:
                         t_stat, p_val = scipy_stats.ttest_ind(x_vals, y_vals, equal_var=False)
                     except Exception as e:
                         logger.warning(f"t-test failed for {metric}: {e}")
                         p_val = np.nan
-                    
+
                     results.append({
+                        'comparison': cfg.comparison_name,
                         'ancestry': ancestry,
-                        'batch_x': batch_x,
-                        'batch_y': batch_y,
+                        'group_x': group_x,
+                        'group_y': group_y,
                         'metric': metric,
                         'mean_x': mean_x,
                         'std_x': std_x,
@@ -834,10 +798,10 @@ def compute_pairwise_comparisons(
                         'p_value': p_val,
                         'neg_log10_p': -np.log10(p_val) if p_val and p_val > 0 else np.nan,
                     })
-    
+
     comparison_df = pd.DataFrame(results)
     logger.info(f"Computed {len(comparison_df)} pairwise comparisons")
-    
+
     return comparison_df
 
 
@@ -853,34 +817,49 @@ def save_results(
     cfg: PipelineConfig,
     logger: logging.Logger
 ) -> Dict[str, str]:
-    """Save all results to GCS."""
+    """Save all results to GCS or local filesystem."""
     fs = get_gcs_filesystem()
     output_dir = cfg.output_dir.replace('gs://', '')
-    
+
     outputs = {}
-    
+
     # Save sample stats (optionally)
-    if cfg.export_per_sample or cfg.mode in ('smoke', 'dev'):
+    if cfg.export_per_sample:
         path = f"{output_dir}/sample_stats.tsv"
         logger.info(f"Saving sample stats to gs://{path}")
         with fs.open(path, 'w') as f:
             sample_stats.to_csv(f, sep='\t', index=False)
         outputs['sample_stats'] = f"gs://{path}"
-    
+
+    # Save sampled per-sample stats
+    if cfg.export_sampled_per_sample and len(sample_stats) > cfg.sampled_per_sample_n:
+        sampled = sample_stats.sample(n=cfg.sampled_per_sample_n, random_state=cfg.random_seed)
+        path = f"{output_dir}/sample_stats.tsv"
+        logger.info(f"Saving sampled per-sample stats ({cfg.sampled_per_sample_n} samples) to gs://{path}")
+        with fs.open(path, 'w') as f:
+            sampled.to_csv(f, sep='\t', index=False)
+        outputs['sample_stats'] = f"gs://{path}"
+    elif cfg.export_sampled_per_sample:
+        path = f"{output_dir}/sample_stats.tsv"
+        logger.info(f"Saving all per-sample stats ({len(sample_stats)} samples) to gs://{path}")
+        with fs.open(path, 'w') as f:
+            sample_stats.to_csv(f, sep='\t', index=False)
+        outputs['sample_stats'] = f"gs://{path}"
+
     # Save group summaries
     path = f"{output_dir}/group_summaries.tsv"
     logger.info(f"Saving group summaries to gs://{path}")
     with fs.open(path, 'w') as f:
         group_summaries.to_csv(f, sep='\t', index=False)
     outputs['group_summaries'] = f"gs://{path}"
-    
+
     # Save comparisons
     path = f"{output_dir}/pairwise_comparisons.tsv"
     logger.info(f"Saving pairwise comparisons to gs://{path}")
     with fs.open(path, 'w') as f:
         comparisons.to_csv(f, sep='\t', index=False)
     outputs['comparisons'] = f"gs://{path}"
-    
+
     # Save config
     path = f"{output_dir}/config.json"
     logger.info(f"Saving config to gs://{path}")
@@ -888,7 +867,7 @@ def save_results(
     with fs.open(path, 'w') as f:
         json.dump(config_dict, f, indent=2, default=str)
     outputs['config'] = f"gs://{path}"
-    
+
     return outputs
 
 # =============================================================================
@@ -896,8 +875,7 @@ def save_results(
 # =============================================================================
 
 def run_pipeline(cfg: PipelineConfig) -> Dict[str, Any]:
-    """
-    Run the complete batch effect analysis pipeline.
+    """Run the complete batch effect analysis pipeline.
 
     Args:
         cfg: Pipeline configuration
@@ -911,7 +889,6 @@ def run_pipeline(cfg: PipelineConfig) -> Dict[str, Any]:
 
     logger.info("=" * 60)
     logger.info(f"Starting batch effect pipeline: {cfg.run_name}")
-    logger.info(f"Mode: {cfg.mode}")
     logger.info(f"Data source: {cfg.data_source}")
     if cfg.data_source == "vcf":
         logger.info(f"VCF path: {cfg.vcf_path}")
@@ -919,6 +896,8 @@ def run_pipeline(cfg: PipelineConfig) -> Dict[str, Any]:
         logger.info(f"Force reimport: {cfg.force_reimport}")
     else:
         logger.info(f"MT path: {cfg.hail_mt_path}")
+    logger.info(f"Comparison: {cfg.comparison_name} (col: {cfg.comparison_col})")
+    logger.info(f"Intervals: {list(cfg.interval_dict.keys())}")
     logger.info(f"Pruning subsample threshold: {cfg.pruning_subsample_n}")
     logger.info("=" * 60)
 
@@ -926,10 +905,12 @@ def run_pipeline(cfg: PipelineConfig) -> Dict[str, Any]:
     _init_hail()
     cluster_info = log_cluster_info(logger)
 
-    # Step 1: Load and filter metadata
+    # Step 1: Load and merge metadata
     logger.info("\n[Step 1/6] Loading metadata...")
     t0 = time.time()
-    metadata = load_metadata(cfg, logger)
+    ancestry_df = load_ancestry(cfg, logger)
+    comparison_df = load_comparison(cfg, logger)
+    metadata = merge_metadata(ancestry_df, comparison_df, cfg, logger)
     metadata = subsample_metadata(metadata, cfg, logger)
     sample_ids = metadata[cfg.sample_id_col].tolist()
     step_timings['step1_load_metadata'] = round(time.time() - t0, 1)
@@ -943,13 +924,13 @@ def run_pipeline(cfg: PipelineConfig) -> Dict[str, Any]:
     logger.info(f"  Step 2 took {step_timings['step2_load_and_filter_mt']}s")
 
     # Step 3: Annotate with metadata
-    logger.info("\n[Step 3/6] Annotating with batch/ancestry labels...")
+    logger.info("\n[Step 3/6] Annotating with group labels...")
     t0 = time.time()
     mt = annotate_mt_with_metadata(mt, metadata, cfg, logger)
     step_timings['step3_annotate_metadata'] = round(time.time() - t0, 1)
     logger.info(f"  Step 3 took {step_timings['step3_annotate_metadata']}s")
 
-    # Step 4: Compute variant stats (explode+group_by — compact bytecode)
+    # Step 4: Compute variant stats (explode+group_by -- compact bytecode)
     logger.info("\n[Step 4/6] Computing variant statistics...")
     t0 = time.time()
     mt = compute_variant_stats(mt, interval_tables, cfg, logger)
@@ -961,7 +942,7 @@ def run_pipeline(cfg: PipelineConfig) -> Dict[str, Any]:
     t0 = time.time()
     sample_stats = extract_sample_stats(mt, cfg, logger)
     step_timings['step5a_extract_to_pandas'] = round(time.time() - t0, 1)
-    logger.info(f"  Step 5a (to_pandas) took {step_timings['step5a_extract_to_pandas']}s — THIS IS THE MAIN COMPUTE COST")
+    logger.info(f"  Step 5a (to_pandas) took {step_timings['step5a_extract_to_pandas']}s -- THIS IS THE MAIN COMPUTE COST")
 
     t0 = time.time()
     sample_stats = compute_derived_metrics(sample_stats, cfg)
@@ -991,11 +972,12 @@ def run_pipeline(cfg: PipelineConfig) -> Dict[str, Any]:
         'spark_metrics': spark_metrics,
         'cluster_info': cluster_info,
         'config_summary': {
-            'mode': cfg.mode,
             'data_source': cfg.data_source,
+            'comparison_name': cfg.comparison_name,
+            'comparison_col': cfg.comparison_col,
             'samples_per_group': cfg.samples_per_group,
-            'n_intervals': len(cfg.interval_dict) if cfg.interval_dict else 0,
-            'interval_names': list(cfg.interval_dict.keys()) if cfg.interval_dict else [],
+            'n_intervals': len(cfg.interval_dict),
+            'interval_names': list(cfg.interval_dict.keys()),
             'pruning_subsample_n': cfg.pruning_subsample_n,
             'n_samples_requested': len(sample_ids),
             'n_samples_extracted': len(sample_stats),
@@ -1034,35 +1016,90 @@ def run_pipeline(cfg: PipelineConfig) -> Dict[str, Any]:
 
 def cli():
     import argparse
-    
-    parser = argparse.ArgumentParser(description='Batch Effect Analysis Pipeline')
-    parser.add_argument('--mode', choices=['smoke', 'dev', 'medium', 'full'], default='dev')
-    parser.add_argument('--batches', nargs='+', help='Batches to include')
-    parser.add_argument('--ancestries', nargs='+', help='Ancestries to include')
-    parser.add_argument('--strategy', choices=['within_ancestry', 'pooled'], default='within_ancestry')
-    parser.add_argument('--output-dir', help='Output directory')
+
+    parser = argparse.ArgumentParser(
+        description='Batch Effect Analysis Pipeline',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  python batch_e.py \\\n"
+            "      --data-source mt --mt-path gs://bucket/data.mt/ \\\n"
+            "      --ancestry-tsv gs://bucket/ancestry.tsv \\\n"
+            "      --comparison-tsv gs://bucket/labels.tsv \\\n"
+            "      --comparison-col site_id \\\n"
+            "      --interval ACMG59=gs://bucket/acmg59.bed \\\n"
+            "      --interval Low_Mappability=gs://bucket/lowmap.bed.gz \\\n"
+            "      --output-dir gs://bucket/results/\n"
+        ),
+    )
+
+    # Data source
     parser.add_argument('--data-source', choices=['vcf', 'mt'], default='vcf',
-                        help='Data source: "vcf" (primary) or "mt" (pre-built MatrixTable)')
-    parser.add_argument('--vcf-path', help='VCF path/glob (default: $WGS_ACAF_THRESHOLD_VCF_PATH)')
+                        help='Data source: "vcf" or "mt" (pre-built MatrixTable)')
+    parser.add_argument('--vcf-path', help='VCF path/glob')
     parser.add_argument('--mt-path', help='Pre-built MT path (for --data-source mt)')
     parser.add_argument('--no-cache', action='store_true', help='Disable MT caching of VCF import')
     parser.add_argument('--force-reimport', action='store_true',
                         help='Ignore cached MT, re-import from VCF')
 
+    # Ancestry
+    parser.add_argument('--ancestry-tsv', required=True, help='Path to ancestry predictions TSV')
+    parser.add_argument('--ancestry-col', default='ancestry_pred_other',
+                        help='Column name for ancestry in ancestry TSV (default: ancestry_pred_other)')
+    parser.add_argument('--ancestries', nargs='+', help='Ancestries to include (default: all)')
+
+    # Comparison
+    parser.add_argument('--comparison-tsv', required=True, help='Path to comparison grouping TSV')
+    parser.add_argument('--comparison-col', required=True,
+                        help='Column name for the grouping variable in comparison TSV')
+    parser.add_argument('--comparison-name', help='Human-readable label (default: same as --comparison-col)')
+    parser.add_argument('--comparison-values', nargs='+',
+                        help='Comparison values to include (default: all)')
+
+    # Intervals
+    parser.add_argument('--interval', action='append', required=True, metavar='NAME=PATH',
+                        help='Interval list as NAME=PATH (repeatable)')
+
+    # Sampling
+    parser.add_argument('--sample-id-col', default='research_id',
+                        help='Sample ID column name shared across TSVs (default: research_id)')
+    parser.add_argument('--samples-per-group', type=int, help='Max samples per (group, ancestry)')
+
+    # Output
+    parser.add_argument('--output-dir', help='Output directory (local or gs://)')
+
     args = parser.parse_args()
 
+    # Parse --interval NAME=PATH pairs
+    interval_dict = {}
+    for item in args.interval:
+        if '=' not in item:
+            parser.error(f"--interval must be NAME=PATH, got: {item!r}")
+        name, path = item.split('=', 1)
+        interval_dict[name] = path
+
     cfg = PipelineConfig(
-        mode=args.mode,
-        batches=args.batches,
-        ancestries=args.ancestries,
-        analysis_strategy=args.strategy,
-        output_dir=args.output_dir,
         data_source=args.data_source,
         vcf_path=args.vcf_path,
         hail_mt_path=args.mt_path,
         cache_mt=not args.no_cache,
         force_reimport=args.force_reimport,
+        ancestry_tsv=args.ancestry_tsv,
+        ancestry_col=args.ancestry_col,
+        ancestries=args.ancestries,
+        comparison_tsv=args.comparison_tsv,
+        comparison_col=args.comparison_col,
+        comparison_name=args.comparison_name,
+        comparison_values=args.comparison_values,
+        interval_dict=interval_dict,
+        sample_id_col=args.sample_id_col,
+        samples_per_group=args.samples_per_group,
+        output_dir=args.output_dir,
     )
-    
+
     results = run_pipeline(cfg)
     print(f"\nOutputs saved to: {cfg.output_dir}")
+
+
+if __name__ == '__main__':
+    cli()
