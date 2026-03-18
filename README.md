@@ -32,8 +32,7 @@ This pipeline implements a **within-ancestry stratified analysis** to separate t
 from batch_e import PipelineConfig, run_pipeline
 
 cfg = PipelineConfig(
-    data_source='mt',
-    hail_mt_path='gs://bucket/data.mt/',
+    input_path='gs://bucket/data.mt/',
     ancestry_tsv='gs://bucket/ancestry.tsv',
     ancestry_col='ancestry_pred_other',
     comparison_tsv='gs://bucket/site_labels.tsv',
@@ -60,7 +59,7 @@ significant = comparisons[comparisons['cohens_d'].abs() > 0.5]
 
 ```bash
 python batch_e.py \
-    --data-source mt --mt-path gs://bucket/data.mt/ \
+    --input-path gs://bucket/data.mt/ \
     --ancestry-tsv gs://bucket/ancestry.tsv \
     --ancestry-col ancestry_pred_other \
     --comparison-tsv gs://bucket/site_labels.tsv \
@@ -84,25 +83,26 @@ The pipeline can be run as a WDL workflow on Terra, using [hailrunner](https://g
 
 Import the workflow from [Dockstore](https://dockstore.org/) or directly from `wdl/batch_e.wdl`.
 
+Intervals default to the 5 standard interval sets (ACMG59, Low_Mappability, GC_gt_85, GC_lt_25, HighConf_Genome) served from GitHub. HTTPS URLs are automatically staged to GCS before the Dataproc analysis runs. The data source is auto-detected from which path is provided (`vcf_path` or `mt_path`).
+
 Example input JSON:
 
 ```json
 {
+    "batch_e.input_path": "gs://bucket/data.mt/",
     "batch_e.ancestry_tsv": "gs://bucket/ancestry.tsv",
     "batch_e.comparison_tsv": "gs://bucket/site_labels.tsv",
     "batch_e.comparison_col": "site_id",
-    "batch_e.comparison_name": "sequencing_center",
-    "batch_e.intervals": [
-        {"name": "ACMG59", "path": "gs://bucket/intervals/acmg59.bed"},
-        {"name": "Low_Mappability", "path": "gs://bucket/intervals/lowmap.bed.gz"}
-    ],
     "batch_e.output_dir": "gs://staging-bucket/batch_effect_results/run_001",
-    "batch_e.mt_path": "gs://bucket/data.mt/",
-    "batch_e.ancestries": ["eur", "afr", "amr"],
-    "batch_e.samples_per_group": "5000",
     "batch_e.staging_bucket": "gs://staging-bucket",
     "batch_e.workers": 32
 }
+```
+
+Override intervals if needed:
+
+```json
+"batch_e.intervals": ["MyRegion=gs://bucket/my_regions.bed.gz"]
 ```
 
 ## Configuration
@@ -126,7 +126,7 @@ Example input JSON:
 | `ancestries` | all | Ancestries to include |
 | `comparison_values` | all | Comparison group values to include |
 | `samples_per_group` | None (all) | Max samples per (group, ancestry) |
-| `data_source` | `vcf` | `"vcf"` or `"mt"` (pre-built MatrixTable) |
+| `input_path` | — | VCF glob or MatrixTable path (auto-detected from `.mt` suffix) |
 | `filter_to_pass` | True | Keep only PASS variants |
 | `filter_FT_pass` | True | Set GT to missing unless FT contains PASS |
 | `pruning_subsample_n` | 50,000 | Subsample large interval lists for partition pruning |

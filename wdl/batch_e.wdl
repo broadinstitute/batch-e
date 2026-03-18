@@ -2,24 +2,23 @@ version 1.0
 
 import "https://raw.githubusercontent.com/broadinstitute/hailrunner/refs/heads/main/hailrunner/wdl/hailrunner_run.wdl" as hailrunner
 
-struct IntervalSpec {
-    String name
-    String path
-}
-
 workflow batch_e {
     input {
         # ---- batch_e analysis inputs (required) ----
+        String input_path    # VCF glob or MatrixTable path (auto-detected)
         String ancestry_tsv
         String comparison_tsv
         String comparison_col
-        Array[IntervalSpec] intervals
         String output_dir
 
         # ---- batch_e analysis inputs (optional) ----
-        String data_source = "mt"
-        String? vcf_path
-        String? mt_path
+        Array[String] intervals = [
+            "ACMG59=https://raw.githubusercontent.com/broadinstitute/batch-e/refs/heads/main/intervals/acmg59_allofus_19dec2019.GRC38.wGenes.NEW.bed.gz",
+            "Low_Mappability=https://raw.githubusercontent.com/broadinstitute/batch-e/refs/heads/main/intervals/GRCh38_lowmappabilityall.bed.gz",
+            "GC_gt_85=https://raw.githubusercontent.com/broadinstitute/batch-e/refs/heads/main/intervals/GRCh38_gc85_slop50.bed.gz",
+            "GC_lt_25=https://raw.githubusercontent.com/broadinstitute/batch-e/refs/heads/main/intervals/GRCh38_gclt25_merged.bed.gz",
+            "HighConf_Genome=https://raw.githubusercontent.com/broadinstitute/batch-e/refs/heads/main/intervals/giab_highconf_wgs_calling_regions_hg38_intersection.downsampled.bed.gz"
+        ]
         String? ancestry_col
         Array[String]? ancestries
         String? comparison_name
@@ -72,27 +71,36 @@ workflow batch_e {
     }
 
     # ================================================================
+    # Stage intervals (download HTTPS → GCS if needed, GCS passthrough)
+    # ================================================================
+    scatter (spec in intervals) {
+        call stage_interval {
+            input:
+                interval_spec = spec,
+                staging_bucket = staging_bucket
+        }
+    }
+
+    # ================================================================
     # Build script_args array from typed inputs
     # ================================================================
 
     # Required args -- always present
     Array[String] required_args = [
+        "--input-path", input_path,
         "--ancestry-tsv", ancestry_tsv,
         "--comparison-tsv", comparison_tsv,
         "--comparison-col", comparison_col,
-        "--data-source", data_source,
         "--output-dir", output_dir
     ]
 
-    # Interval args (scatter over struct array, flatten pairs)
-    scatter (spec in intervals) {
-        Array[String] one_interval = ["--interval", spec.name + "=" + spec.path]
+    # Interval args from staged specs
+    scatter (staged in stage_interval.staged_spec) {
+        Array[String] one_interval = ["--interval", staged]
     }
     Array[String] interval_args = flatten(one_interval)
 
     # Optional scalar string args
-    Array[String] mt_path_args = if defined(mt_path) then ["--mt-path", select_first([mt_path])] else []
-    Array[String] vcf_path_args = if defined(vcf_path) then ["--vcf-path", select_first([vcf_path])] else []
     Array[String] ancestry_col_args = if defined(ancestry_col) then ["--ancestry-col", select_first([ancestry_col])] else []
     Array[String] comparison_name_args = if defined(comparison_name) then ["--comparison-name", select_first([comparison_name])] else []
     Array[String] sample_id_col_args = if defined(sample_id_col) then ["--sample-id-col", select_first([sample_id_col])] else []
@@ -110,8 +118,6 @@ workflow batch_e {
     Array[String] all_script_args = flatten([
         required_args,
         interval_args,
-        mt_path_args,
-        vcf_path_args,
         ancestry_col_args,
         comparison_name_args,
         sample_id_col_args,
@@ -185,6 +191,44 @@ workflow batch_e {
     output {
         Array[File] analysis_files = analysis.output_files
         File report_html = generate_report.report_html
+    }
+}
+
+# ================================================================
+# Stage interval files: download HTTPS → GCS, pass through GCS paths
+# ================================================================
+task stage_interval {
+    input {
+        String interval_spec   # "NAME=PATH" or "NAME=https://..."
+        String staging_bucket
+        String docker = "google/cloud-sdk:slim"
+    }
+
+    command <<<
+        set -euo pipefail
+        spec="~{interval_spec}"
+        name="${spec%%=*}"
+        path="${spec#*=}"
+
+        if [[ "$path" == http://* ]] || [[ "$path" == https://* ]]; then
+            gcs_dest="~{staging_bucket}/staged_intervals/${name}.bed.gz"
+            curl -fsSL "$path" -o interval_file
+            gsutil cp interval_file "$gcs_dest"
+            echo "${name}=${gcs_dest}" > result.txt
+        else
+            echo "$spec" > result.txt
+        fi
+    >>>
+
+    output {
+        String staged_spec = read_string("result.txt")
+    }
+
+    runtime {
+        docker: docker
+        memory: "2GB"
+        disks: "local-disk 10 SSD"
+        cpu: 1
     }
 }
 

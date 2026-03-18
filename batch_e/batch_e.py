@@ -8,8 +8,7 @@ instrument, lab) across genomic interval classes, stratified by genetic ancestry
 
 Usage in notebook:
     cfg = PipelineConfig(
-        data_source='mt',
-        hail_mt_path='gs://bucket/data.mt/',
+        input_path='gs://bucket/data.mt/',
         ancestry_tsv='gs://bucket/ancestry.tsv',
         comparison_tsv='gs://bucket/labels.tsv',
         comparison_col='site_id',
@@ -19,7 +18,7 @@ Usage in notebook:
 
 Usage from command line:
     python batch_e.py \
-        --data-source mt --mt-path gs://bucket/data.mt/ \
+        --input-path 'gs://bucket/*.vcf.gz' \
         --ancestry-tsv gs://bucket/ancestry.tsv \
         --comparison-tsv gs://bucket/labels.tsv \
         --comparison-col site_id \
@@ -75,10 +74,8 @@ class PipelineConfig:
     # Sample subsetting
     samples_per_group: Optional[int] = None  # None = all samples (no subsampling)
 
-    # Data source
-    data_source: str = "vcf"          # "vcf" (primary) or "mt" (fast path using pre-built MT)
-    vcf_path: Optional[str] = None    # glob pattern, e.g., "gs://.../*.vcf.bgz"
-    hail_mt_path: Optional[str] = None  # pre-built MT path (used when data_source="mt")
+    # Input path (required) — VCF glob or pre-built MatrixTable; auto-detected
+    input_path: Optional[str] = None
 
     # VCF preprocessing
     split_multi: bool = True           # split multi-allelic sites (required for VCF input)
@@ -130,6 +127,14 @@ class PipelineConfig:
 
     def __post_init__(self):
         """Validate required fields and set defaults."""
+        # Validate input path
+        if not self.input_path:
+            raise ValueError("input_path is required (VCF glob or MatrixTable path)")
+
+        # Auto-detect data source: paths ending in .mt or .mt/ are MatrixTables
+        stripped = self.input_path.rstrip('/')
+        self.data_source = "mt" if stripped.endswith('.mt') else "vcf"
+
         # Validate required fields
         if not self.ancestry_tsv:
             raise ValueError("ancestry_tsv is required (path to ancestry predictions TSV)")
@@ -152,6 +157,10 @@ class PipelineConfig:
         # Set output directory
         if self.output_dir is None:
             self.output_dir = f"batch_effect_results/{self.run_name}"
+
+        # Auto-generate cache_mt_path for VCF imports
+        if self.data_source == "vcf" and self.cache_mt and self.cache_mt_path is None:
+            self.cache_mt_path = os.path.join(self.output_dir, "imported.mt")
 
 
 # =============================================================================
@@ -385,9 +394,9 @@ def import_from_vcf(cfg: PipelineConfig, logger: logging.Logger):
     """Import VCFs, split multi-allelics, optionally apply ACAF filter."""
     hl = _init_hail()
 
-    logger.info(f"Importing VCFs from {cfg.vcf_path}")
+    logger.info(f"Importing VCFs from {cfg.input_path}")
     mt = hl.import_vcf(
-        cfg.vcf_path,
+        cfg.input_path,
         force_bgz=True,
         reference_genome='GRCh38',
         array_elements_required=False,
@@ -443,8 +452,8 @@ def load_and_filter_mt(
                 logger.info(f"Cached imported MT to {cfg.cache_mt_path}")
         logger.info(f"MT ready: {mt.n_partitions()} partitions (row/col counts deferred)")
     elif cfg.data_source == "mt":
-        logger.info(f"Loading pre-built MatrixTable from {cfg.hail_mt_path}")
-        mt = hl.read_matrix_table(cfg.hail_mt_path)
+        logger.info(f"Loading pre-built MatrixTable from {cfg.input_path}")
+        mt = hl.read_matrix_table(cfg.input_path)
         logger.info(f"MT loaded: {mt.n_partitions()} partitions (row/col counts deferred)")
     else:
         raise ValueError(f"Unknown data_source: {cfg.data_source!r} (expected 'vcf' or 'mt')")
@@ -889,13 +898,10 @@ def run_pipeline(cfg: PipelineConfig) -> Dict[str, Any]:
 
     logger.info("=" * 60)
     logger.info(f"Starting batch effect pipeline: {cfg.run_name}")
-    logger.info(f"Data source: {cfg.data_source}")
+    logger.info(f"Input: {cfg.input_path} (detected: {cfg.data_source})")
     if cfg.data_source == "vcf":
-        logger.info(f"VCF path: {cfg.vcf_path}")
         logger.info(f"Cache MT: {cfg.cache_mt} (path: {cfg.cache_mt_path})")
         logger.info(f"Force reimport: {cfg.force_reimport}")
-    else:
-        logger.info(f"MT path: {cfg.hail_mt_path}")
     logger.info(f"Comparison: {cfg.comparison_name} (col: {cfg.comparison_col})")
     logger.info(f"Intervals: {list(cfg.interval_dict.keys())}")
     logger.info(f"Pruning subsample threshold: {cfg.pruning_subsample_n}")
@@ -1023,7 +1029,7 @@ def cli():
         epilog=(
             "Examples:\n"
             "  python batch_e.py \\\n"
-            "      --data-source mt --mt-path gs://bucket/data.mt/ \\\n"
+            "      --input-path gs://bucket/data.mt/ \\\n"
             "      --ancestry-tsv gs://bucket/ancestry.tsv \\\n"
             "      --comparison-tsv gs://bucket/labels.tsv \\\n"
             "      --comparison-col site_id \\\n"
@@ -1033,11 +1039,9 @@ def cli():
         ),
     )
 
-    # Data source
-    parser.add_argument('--data-source', choices=['vcf', 'mt'], default='vcf',
-                        help='Data source: "vcf" or "mt" (pre-built MatrixTable)')
-    parser.add_argument('--vcf-path', help='VCF path/glob')
-    parser.add_argument('--mt-path', help='Pre-built MT path (for --data-source mt)')
+    # Input data
+    parser.add_argument('--input-path', required=True,
+                        help='VCF path/glob or MatrixTable path (auto-detected: *.mt → MT, otherwise VCF)')
     parser.add_argument('--no-cache', action='store_true', help='Disable MT caching of VCF import')
     parser.add_argument('--force-reimport', action='store_true',
                         help='Ignore cached MT, re-import from VCF')
@@ -1079,9 +1083,7 @@ def cli():
         interval_dict[name] = path
 
     cfg = PipelineConfig(
-        data_source=args.data_source,
-        vcf_path=args.vcf_path,
-        hail_mt_path=args.mt_path,
+        input_path=args.input_path,
         cache_mt=not args.no_cache,
         force_reimport=args.force_reimport,
         ancestry_tsv=args.ancestry_tsv,
