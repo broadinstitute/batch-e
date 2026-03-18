@@ -1,3 +1,5 @@
+version 1.0
+
 import "https://raw.githubusercontent.com/broadinstitute/hailrunner/refs/heads/main/hailrunner/wdl/hailrunner_run.wdl" as hailrunner
 
 struct IntervalSpec {
