@@ -53,7 +53,7 @@ workflow batch_e {
         Int executor_cores = 4
         String executor_memory = "26g"
         Int driver_cores = 4
-        String driver_memory = "26g"
+        String driver_memory = "180g"
 
         # ---- hailrunner WDL runtime ----
         String hailrunner_memory = "4GB"
