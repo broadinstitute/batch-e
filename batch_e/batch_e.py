@@ -422,6 +422,21 @@ def import_from_vcf(cfg: PipelineConfig, logger: logging.Logger):
     return mt
 
 
+def _mt_complete(path: str) -> bool:
+    """Check if a completed MatrixTable exists at path."""
+    hl = _init_hail()
+    return hl.hadoop_exists(path + "/_SUCCESS")
+
+
+def _remove_mt(path: str, logger: logging.Logger) -> None:
+    """Remove a (possibly partial) MatrixTable directory."""
+    import subprocess
+    hl = _init_hail()
+    if hl.hadoop_exists(path):
+        logger.info(f"Removing {path}")
+        subprocess.run(["gsutil", "-m", "-q", "rm", "-r", path], check=False)
+
+
 def load_and_filter_mt(
     cfg: PipelineConfig,
     sample_ids: List[str],
@@ -435,26 +450,29 @@ def load_and_filter_mt(
     hl = _init_hail()
 
     if cfg.data_source == "vcf":
-        # --- VCF path: check cache first, then import ---
-        if cfg.cache_mt and not cfg.force_reimport:
-            try:
+        loaded_from_cache = False
+
+        if cfg.cache_mt and not cfg.force_reimport and cfg.cache_mt_path:
+            if _mt_complete(cfg.cache_mt_path):
                 mt = hl.read_matrix_table(cfg.cache_mt_path)
                 logger.info(f"Loaded cached MT from {cfg.cache_mt_path}")
-            except Exception:
-                logger.info("No cached MT found, importing from VCF")
-                mt = import_from_vcf(cfg, logger)
-                if cfg.cache_mt:
-                    logger.info(f"Writing cache to {cfg.cache_mt_path}")
-                    mt.write(cfg.cache_mt_path, overwrite=True)
-                    mt = hl.read_matrix_table(cfg.cache_mt_path)
-                    logger.info(f"Cached imported MT to {cfg.cache_mt_path}")
-        else:
+                loaded_from_cache = True
+            elif hl.hadoop_exists(cfg.cache_mt_path):
+                logger.warning(
+                    f"Cache at {cfg.cache_mt_path} exists but has no _SUCCESS marker "
+                    f"— likely corrupt from a failed write. Deleting and re-importing."
+                )
+                _remove_mt(cfg.cache_mt_path, logger)
+
+        if not loaded_from_cache:
             mt = import_from_vcf(cfg, logger)
-            if cfg.cache_mt:
-                logger.info(f"Writing cache to {cfg.cache_mt_path} (force_reimport={cfg.force_reimport})")
+            if cfg.cache_mt and cfg.cache_mt_path:
+                _remove_mt(cfg.cache_mt_path, logger)  # clean slate
+                logger.info(f"Writing cache to {cfg.cache_mt_path}")
                 mt.write(cfg.cache_mt_path, overwrite=True)
                 mt = hl.read_matrix_table(cfg.cache_mt_path)
                 logger.info(f"Cached imported MT to {cfg.cache_mt_path}")
+
         logger.info(f"MT ready: {mt.n_partitions()} partitions (row/col counts deferred)")
     elif cfg.data_source == "mt":
         logger.info(f"Loading pre-built MatrixTable from {cfg.input_path}")
