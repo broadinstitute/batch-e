@@ -403,6 +403,11 @@ def import_from_vcf(cfg: PipelineConfig, logger: logging.Logger):
     )
     logger.info(f"Imported VCF: {mt.count_cols()} samples, {mt.n_partitions()} partitions")
 
+    # Drop unused entry fields BEFORE split_multi_hts to avoid array index
+    # errors on truncated AD arrays in multi-allelic sites
+    mt = mt.select_entries(mt.GT, mt.FT)
+    logger.info("Selected entry fields: GT, FT (dropped AD/DP/GQ/PL before splitting)")
+
     if cfg.split_multi:
         mt = hl.split_multi_hts(mt)
         logger.info("Split multi-allelic sites")
@@ -459,8 +464,10 @@ def load_and_filter_mt(
         raise ValueError(f"Unknown data_source: {cfg.data_source!r} (expected 'vcf' or 'mt')")
 
     # --- Drop unused entry fields early (only GT and FT are needed) ---
-    mt = mt.select_entries(mt.GT, mt.FT)
-    logger.info("Selected entry fields: GT, FT (dropped unused fields)")
+    # (VCF path already did this in import_from_vcf, before split_multi_hts)
+    if cfg.data_source == "mt":
+        mt = mt.select_entries(mt.GT, mt.FT)
+        logger.info("Selected entry fields: GT, FT (dropped unused fields)")
 
     # --- Filter columns (samples) BEFORE rows for efficiency ---
     sample_set = hl.literal(set(sample_ids))
