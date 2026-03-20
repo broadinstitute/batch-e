@@ -107,7 +107,6 @@ class PipelineConfig:
 
     # Interval lists for stratified analysis
     interval_dict: Optional[Dict[str, str]] = None  # required — no defaults
-    pruning_subsample_n: Optional[int] = 50_000  # Subsample large interval lists for partition pruning
 
     # Sampling parameters
     random_seed: int = 42
@@ -492,9 +491,8 @@ def load_and_filter_mt(
     mt = mt.filter_cols(sample_set.contains(mt.s))
     logger.info(f"Filtering to {len(sample_ids)} requested samples (lazy)")
 
-    # --- Load intervals once (used for both partition pruning and annotation) ---
+    # --- Load interval tables (used for row filtering and annotation) ---
     interval_tables = {}
-    all_intervals_for_pruning = []
 
     for name, path in cfg.interval_dict.items():
         logger.info(f"Loading interval list: {name}")
@@ -514,35 +512,23 @@ def load_and_filter_mt(
                     filter=r'^#'
                 )
 
-            # Keep the table for annotation later
             interval_tables[name] = interval_table
-
-            # Collect intervals for partition pruning
-            intervals = interval_table.interval.collect()
-            logger.info(f"  {name}: {len(intervals)} intervals")
-
-            # Subsample large interval lists for partition pruning
-            if cfg.pruning_subsample_n is not None and len(intervals) > cfg.pruning_subsample_n:
-                rng = np.random.RandomState(cfg.random_seed)
-                idx = rng.choice(len(intervals), size=cfg.pruning_subsample_n, replace=False)
-                intervals = [intervals[i] for i in sorted(idx)]
-                logger.info(f"  Subsampled {name} to {len(intervals)} intervals for pruning")
-
-            all_intervals_for_pruning.append(intervals)
+            logger.info(f"  {name}: loaded")
 
         except Exception as e:
             logger.warning(f"  Failed to load {name}: {e}")
             continue
 
-    # Flatten all intervals and apply partition pruning
-    flat_intervals = [iv for sublist in all_intervals_for_pruning for iv in sublist]
-    logger.info(f"Total: {len(flat_intervals)} intervals for partition pruning")
-
-    if flat_intervals:
-        partitions_before = mt.n_partitions()
-        mt = hl.filter_intervals(mt, flat_intervals, keep=True)
-        partitions_after = mt.n_partitions()
-        logger.info(f"Partition pruning: {partitions_before} -> {partitions_after} partitions ({partitions_before - partitions_after} pruned)")
+    # Filter rows to interval regions via distributed table semi-join.
+    # This replaces hl.filter_intervals() which crashes with large interval
+    # lists (153K+) because it serializes all intervals as IR literals in an
+    # HTTP POST to the JVM backend, exceeding the payload limit.
+    if interval_tables:
+        all_intervals_ht = hl.Table.union(*[
+            t.select().select_globals() for t in interval_tables.values()
+        ])
+        mt = mt.filter_rows(hl.is_defined(all_intervals_ht[mt.locus]))
+        logger.info(f"Filtered rows to {len(interval_tables)} interval sets (table semi-join)")
 
     # Apply variant filters
     if cfg.filter_to_pass:
@@ -929,7 +915,6 @@ def run_pipeline(cfg: PipelineConfig) -> Dict[str, Any]:
         logger.info(f"Force reimport: {cfg.force_reimport}")
     logger.info(f"Comparison: {cfg.comparison_name} (col: {cfg.comparison_col})")
     logger.info(f"Intervals: {list(cfg.interval_dict.keys())}")
-    logger.info(f"Pruning subsample threshold: {cfg.pruning_subsample_n}")
     logger.info("=" * 60)
 
     # Log cluster info after Hail init
@@ -1009,7 +994,6 @@ def run_pipeline(cfg: PipelineConfig) -> Dict[str, Any]:
             'samples_per_group': cfg.samples_per_group,
             'n_intervals': len(cfg.interval_dict),
             'interval_names': list(cfg.interval_dict.keys()),
-            'pruning_subsample_n': cfg.pruning_subsample_n,
             'n_samples_requested': len(sample_ids),
             'n_samples_extracted': len(sample_stats),
         },
