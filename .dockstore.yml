@@ -5,3 +5,7 @@ workflows:
     subclass: WDL
     primaryDescriptorPath: /wdl/batch_e.wdl
     topic: Batch effect analysis on WGS data with Hail on ephemeral Dataproc
+  - name: batch-e-report
+    subclass: WDL
+    primaryDescriptorPath: /wdl/batch_e_report.wdl
+    topic: Report-only wrapper for a completed batch-e run
