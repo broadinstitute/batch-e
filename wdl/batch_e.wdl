@@ -13,11 +13,11 @@ workflow batch_e {
 
         # ---- batch_e analysis inputs (optional) ----
         Array[String] intervals = [
-            "ACMG59=https://raw.githubusercontent.com/broadinstitute/batch-e/refs/heads/main/intervals/acmg59_allofus_19dec2019.GRC38.wGenes.NEW.bed.gz",
-            "Low_Mappability=https://raw.githubusercontent.com/broadinstitute/batch-e/refs/heads/main/intervals/GRCh38_lowmappabilityall.bed.gz",
-            "GC_gt_85=https://raw.githubusercontent.com/broadinstitute/batch-e/refs/heads/main/intervals/GRCh38_gc85_slop50.bed.gz",
-            "GC_lt_25=https://raw.githubusercontent.com/broadinstitute/batch-e/refs/heads/main/intervals/GRCh38_gclt25_merged.bed.gz",
-            "HighConf_Genome=https://raw.githubusercontent.com/broadinstitute/batch-e/refs/heads/main/intervals/giab_highconf_wgs_calling_regions_hg38_intersection.downsampled.bed.gz"
+            "ACMG59=/opt/batch_e/intervals/acmg59_allofus_19dec2019.GRC38.wGenes.NEW.bed.gz",
+            "Low_Mappability=/opt/batch_e/intervals/GRCh38_lowmappabilityall.bed.gz",
+            "GC_gt_85=/opt/batch_e/intervals/GRCh38_gc85_slop50.bed.gz",
+            "GC_lt_25=/opt/batch_e/intervals/GRCh38_gclt25_merged.bed.gz",
+            "HighConf_Genome=/opt/batch_e/intervals/giab_highconf_wgs_calling_regions_hg38_intersection.downsampled.bed.gz"
         ]
         String? ancestry_col
         Array[String]? ancestries
@@ -28,9 +28,8 @@ workflow batch_e {
         Boolean no_cache = false
         Boolean force_reimport = false
 
-        # ---- Script URLs ----
+        # ---- Script URL fetched by hailrunner at run time ----
         String batch_e_script = "https://raw.githubusercontent.com/broadinstitute/batch-e/refs/heads/main/batch_e/batch_e.py"
-        String reporter_script = "https://raw.githubusercontent.com/broadinstitute/batch-e/refs/heads/main/batch_e/batch_e_reporter.py"
 
         # ---- hailrunner cluster config ----
         String staging_bucket
@@ -61,23 +60,26 @@ workflow batch_e {
         Int hailrunner_cpu = 2
         String hailrunner_docker = "us-docker.pkg.dev/broad-dsde-methods/hailrunner/hailrunner:0.1.0"
 
+        # ---- batch_e utility image (short tasks only: stage_interval, generate_report) ----
+        String batch_e_docker = "us-docker.pkg.dev/broad-dsde-methods/batch-e/batch-e:latest"
+
         # ---- Reporter inputs ----
         String report_title = "Batch Effect Report"
         Boolean report_no_sample_stats = false
         Float report_effect_threshold = 0.5
-        String reporter_docker = "python:3.11-slim"
         String reporter_memory = "8GB"
         Int reporter_disk_gb = 50
     }
 
     # ================================================================
-    # Stage intervals (download HTTPS → GCS if needed, GCS passthrough)
+    # Stage intervals (local baked-in / https / gs:// -> staged GCS)
     # ================================================================
     scatter (spec in intervals) {
         call stage_interval {
             input:
                 interval_spec = spec,
-                staging_bucket = staging_bucket
+                staging_bucket = staging_bucket,
+                docker = batch_e_docker
         }
     }
 
@@ -140,7 +142,7 @@ workflow batch_e {
     ]
 
     # ================================================================
-    # Phase 1: Run batch_e analysis on Dataproc via hailrunner
+    # Phase 1: Run batch_e analysis on Dataproc via hailrunner (stock image)
     # ================================================================
     call hailrunner.hailrunner_run as analysis {
         input:
@@ -173,17 +175,16 @@ workflow batch_e {
     }
 
     # ================================================================
-    # Phase 2: Generate HTML report (lightweight, no Dataproc)
+    # Phase 2: Generate HTML report (batch_e utility image, no Dataproc)
     # ================================================================
     call generate_report {
         input:
             analysis_outputs    = analysis.output_files,
             results_dir         = output_dir,
-            reporter_script_url = reporter_script,
             title               = report_title,
             no_sample_stats     = report_no_sample_stats,
             effect_threshold    = report_effect_threshold,
-            docker              = reporter_docker,
+            docker              = batch_e_docker,
             memory              = reporter_memory,
             disk_gb             = reporter_disk_gb
     }
@@ -195,13 +196,13 @@ workflow batch_e {
 }
 
 # ================================================================
-# Stage interval files: download HTTPS → GCS, pass through GCS paths
+# Stage interval files: local (baked-in) / https / gs:// -> GCS
 # ================================================================
 task stage_interval {
     input {
-        String interval_spec   # "NAME=PATH" or "NAME=https://..."
+        String interval_spec   # "NAME=PATH" or "NAME=https://..." or "NAME=gs://..."
         String staging_bucket
-        String docker = "google/cloud-sdk:slim"
+        String docker
     }
 
     command <<<
@@ -210,13 +211,21 @@ task stage_interval {
         name="${spec%%=*}"
         path="${spec#*=}"
 
+        gcs_dest="~{staging_bucket}/staged_intervals/${name}.bed.gz"
+
         if [[ "$path" == http://* ]] || [[ "$path" == https://* ]]; then
-            gcs_dest="~{staging_bucket}/staged_intervals/${name}.bed.gz"
             curl -fsSL "$path" -o interval_file
             gsutil cp interval_file "$gcs_dest"
             echo "${name}=${gcs_dest}" > result.txt
-        else
+        elif [[ "$path" == gs://* ]]; then
             echo "$spec" > result.txt
+        else
+            if [[ ! -f "$path" ]]; then
+                echo "ERROR: local interval file not found in image: $path" >&2
+                exit 1
+            fi
+            gsutil cp "$path" "$gcs_dest"
+            echo "${name}=${gcs_dest}" > result.txt
         fi
     >>>
 
@@ -236,11 +245,10 @@ task generate_report {
     input {
         Array[File] analysis_outputs
         String results_dir
-        String reporter_script_url
         String title = "Batch Effect Report"
         Boolean no_sample_stats = false
         Float effect_threshold = 0.5
-        String docker = "python:3.11-slim"
+        String docker
         String memory = "8GB"
         Int disk_gb = 50
     }
@@ -248,11 +256,7 @@ task generate_report {
     command <<<
         set -euo pipefail
 
-        pip install --quiet pandas numpy matplotlib seaborn gcsfs scikit-learn
-
-        curl -fsSL "~{reporter_script_url}" -o batch_e_reporter.py
-
-        python3 batch_e_reporter.py \
+        python3 /opt/batch_e/batch_e_reporter.py \
             "~{results_dir}" \
             -o report.html \
             --title "~{title}" \

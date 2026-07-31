@@ -83,7 +83,7 @@ The pipeline can be run as a WDL workflow on Terra, using [hailrunner](https://g
 
 Import the workflow from [Dockstore](https://dockstore.org/) or directly from `wdl/batch_e.wdl`.
 
-Intervals default to the 5 standard interval sets (ACMG59, Low_Mappability, GC_gt_85, GC_lt_25, HighConf_Genome) served from GitHub. HTTPS URLs are automatically staged to GCS before the Dataproc analysis runs. The data source is auto-detected from which path is provided (`vcf_path` or `mt_path`).
+Intervals default to the 5 standard interval sets (ACMG59, Low_Mappability, GC_gt_85, GC_lt_25, HighConf_Genome) baked into the batch_e utility docker image at `/opt/batch_e/intervals/`. They are staged to GCS by `stage_interval` before Dataproc reads them. Override with `gs://` or `https://` paths to swap in your own. The data source is auto-detected from `input_path` (`.mt` -> MatrixTable, otherwise VCF glob).
 
 Example input JSON:
 
@@ -169,7 +169,38 @@ Designed to run on Google Cloud Dataproc via [Terra](https://terra.bio/) or via 
 │   ├── *.bed.gz                # Genomic interval files
 │   ├── scripts/                # Interval download and processing utilities
 │   └── downsample_report/      # Interval downsampling analysis
+├── docker/
+│   ├── Dockerfile              # Runtime image (FROM hailrunner:0.1.0)
+│   ├── push.sh                 # Build + push to Artifact Registry
+│   └── .dockerignore
 └── .dockstore.yml              # Dockstore workflow registration
+```
+
+## Docker Image
+
+The short WDL utility tasks (`stage_interval`, `generate_report`) run in a
+lean custom image published to
+`us-docker.pkg.dev/broad-dsde-methods/batch-e/batch-e`. It bakes in the
+default interval BEDs, `batch_e_reporter.py`, and the pandas/matplotlib
+stack the reporter needs, plus gcloud/gsutil for interval staging. No
+`curl` or `pip install` at task run time.
+
+The heavy analysis task still runs on the stock `hailrunner` image
+(`us-docker.pkg.dev/broad-dsde-methods/hailrunner/hailrunner:0.1.0`) and
+hailrunner itself fetches `batch_e.py` by URL at run time. That path is
+unchanged.
+
+Build and push:
+
+```bash
+cd docker
+./push.sh   # tags :<git-short-sha> and :latest, pushes to Artifact Registry
+```
+
+Pin a specific utility image at run time via `batch_e.batch_e_docker`:
+
+```json
+"batch_e.batch_e_docker": "us-docker.pkg.dev/broad-dsde-methods/batch-e/batch-e:abc1234"
 ```
 
 ## License

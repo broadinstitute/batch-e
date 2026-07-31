@@ -1,0 +1,15 @@
+.git/
+.gitignore
+.dockstore.yml
+tarpit/
+wdl/
+docker/
+*.pyc
+__pycache__/
+**/__pycache__/
+*.md
+LICENSE
+blood_saliva_v1.json
+intervals/scripts/
+intervals/downsample_report/
+intervals/README.md
