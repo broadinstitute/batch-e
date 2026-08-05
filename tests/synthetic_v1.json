@@ -1,0 +1,27 @@
+{
+    "batch_e.input_path": "gs://fc-secure-b337ea24-f011-4291-9725-f553a53d6e94/batch_e_synth_v1/synthetic.mt",
+    "batch_e.ancestry_tsv": "gs://fc-secure-b337ea24-f011-4291-9725-f553a53d6e94/batch_e_synth_v1/ancestry.tsv",
+    "batch_e.ancestry_col": "ancestry_pred_other",
+    "batch_e.comparison_tsv": "gs://fc-secure-b337ea24-f011-4291-9725-f553a53d6e94/batch_e_synth_v1/comparison.tsv",
+    "batch_e.comparison_col": "sample_source",
+    "batch_e.comparison_name": "sample_type",
+    "batch_e.intervals": [
+        "ACMG59=gs://fc-secure-b337ea24-f011-4291-9725-f553a53d6e94/batch_e_synth_v1/intervals/ACMG59.bed.gz",
+        "Low_Mappability=gs://fc-secure-b337ea24-f011-4291-9725-f553a53d6e94/batch_e_synth_v1/intervals/Low_Mappability.bed.gz",
+        "GC_gt_85=gs://fc-secure-b337ea24-f011-4291-9725-f553a53d6e94/batch_e_synth_v1/intervals/GC_gt_85.bed.gz",
+        "GC_lt_25=gs://fc-secure-b337ea24-f011-4291-9725-f553a53d6e94/batch_e_synth_v1/intervals/GC_lt_25.bed.gz",
+        "HighConf_Genome=gs://fc-secure-b337ea24-f011-4291-9725-f553a53d6e94/batch_e_synth_v1/intervals/HighConf_Genome.bed.gz"
+    ],
+    "batch_e.output_dir": "gs://fc-secure-b337ea24-f011-4291-9725-f553a53d6e94/batch_effect_results/synthetic_v1",
+    "batch_e.staging_bucket": "gs://fc-secure-b337ea24-f011-4291-9725-f553a53d6e94",
+    "batch_e.report_title": "Synthetic v1 smoke test",
+    "batch_e.workers": 2,
+    "batch_e.preemptibles": 0,
+    "batch_e.worker_type": "n1-standard-4",
+    "batch_e.driver_type": "n1-standard-4",
+    "batch_e.worker_disk_gb": 100,
+    "batch_e.driver_disk_gb": 100,
+    "batch_e.driver_memory": "8g",
+    "batch_e.executor_memory": "8g",
+    "batch_e.max_age": 60
+}
